@@ -1,0 +1,33 @@
+# Entorno y secretos
+.env
+.venv*/
+venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+logs/
+*.log
+
+# Archivos temporales
+tmpclaude-*/
+*.tmp
+*.temp
+
+# Audios y pruebas locales
+test_input.wav
+test_input_norm.wav
+kurisu_output.wav
+
+# IDE
+.vscode/
+.idea/
+
+# Sistema
+Thumbs.db
+Desktop.ini
