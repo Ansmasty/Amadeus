@@ -29,18 +29,4 @@ colorlog>=6.0.0
 
 # Sistema — CPU, RAM, batería, disco
 psutil>=5.9.0
-
-#fairseq==0.12.2
-faiss-cpu==1.7.3
-fastapi
-ffmpeg-python
-loguru
-omegaconf==2.0.6
-praat-parselmouth>=0.4.2
-python-multipart
-pyworld
-torch>=2.5.1
-torchaudio>=2.5.1
-torchcrepe
-uvicorn
 numpy<=1.23.5

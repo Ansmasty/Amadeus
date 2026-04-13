@@ -13,7 +13,7 @@ color 0A
 echo Iniciando AMADEUS (texto)...
 where py >nul 2>&1
 if %errorlevel%==0 (
-    py -3 -X utf8 main.py 1>"%LOG%" 2>&1
+    py -3.10 -X utf8 main.py 1>"%LOG%" 2>&1
 ) else (
     python -X utf8 main.py 1>"%LOG%" 2>&1
 )
