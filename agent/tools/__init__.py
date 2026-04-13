@@ -12,6 +12,7 @@ from agent.tools.filesystem import (
     copy_file,
 )
 from agent.tools.browser import open_url, search_youtube
+from agent.tools.browser import search_web
 from agent.tools.data_analysis import read_excel, read_csv
 from agent.tools.system_apps import (
     open_application,
@@ -40,6 +41,7 @@ ALL_TOOLS = [
     # Browser
     open_url,
     search_youtube,
+    search_web,
     # Data analysis
     read_excel,
     read_csv,

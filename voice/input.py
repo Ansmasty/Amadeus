@@ -35,13 +35,7 @@ def list_microphones() -> list[tuple[int, str]]:
 
 
 def pick_microphone() -> int | None:
-    """
-    Muestra SOLO los micrófonos (entradas) disponibles y deja al usuario elegir.
-    Retorna el índice seleccionado, o None para usar el dispositivo por defecto.
-    Guarda la elección en la variable de entorno MICROPHONE_INDEX para
-    que no vuelva a preguntar en la misma sesión.
-    """
-    # Si ya se eligió en esta sesión, reutilizar
+    """Retorna el índice configurado en MICROPHONE_INDEX o None para el predeterminado."""
     saved = os.getenv("MICROPHONE_INDEX", "").strip()
     if saved.lstrip("-").isdigit():
         idx = int(saved)
@@ -49,44 +43,7 @@ def pick_microphone() -> int | None:
             return idx
         return None
 
-    mics = list_microphones()
-    if not mics:
-        print("[VOZ] No se encontraron micrófonos de entrada.")
-        return None
-
-    print("\n" + "─" * 60)
-    print("🎙️  SELECCIÓN DE MICRÓFONO  (solo entradas de audio)")
-    print("─" * 60)
-    for idx, name in mics:
-        print(f"  [{idx:2d}] {name}")
-    print("─" * 60)
-    print("  [Enter] Usar dispositivo por defecto del sistema")
-    print("─" * 60)
-
-    # Construir set de índices válidos para validación rápida
-    valid_indices = {idx for idx, _ in mics}
-
-    while True:
-        try:
-            raw = input("Elige el número de tu micrófono: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return None
-
-        if raw == "":
-            print("[VOZ] Usando dispositivo por defecto.")
-            os.environ["MICROPHONE_INDEX"] = "-1"
-            return None
-
-        if raw.isdigit():
-            chosen = int(raw)
-            if chosen in valid_indices:
-                chosen_name = next(name for idx, name in mics if idx == chosen)
-                print(f"[VOZ] Micrófono seleccionado: [{chosen}] {chosen_name}")
-                os.environ["MICROPHONE_INDEX"] = str(chosen)
-                return chosen
-
-        valid_str = ", ".join(str(i) for i, _ in mics)
-        print(f"[VOZ] Índice no válido. Elige uno de: {valid_str}")
+    return None
 
 
 def _test_microphone(device_index: int | None) -> bool:
@@ -124,7 +81,7 @@ class VoiceInput:
         self._whisper_model = None
         self._mic_index: int | None = None
 
-        # Selección y validación del micrófono
+        # Selección y validación del micrófono sin menú interactivo
         self._mic_index = self._resolve_microphone()
 
         if self.use_whisper:
@@ -132,27 +89,24 @@ class VoiceInput:
 
     def _resolve_microphone(self) -> int | None:
         """
-        Selecciona el micrófono y lo valida antes de usarlo.
-        Si el elegido falla, intenta con el dispositivo por defecto.
+        Usa el micrófono configurado por entorno si existe.
+        En caso contrario, usa el dispositivo por defecto sin mostrar menú.
         """
-        chosen = pick_microphone()
-
-        # Verificar que el dispositivo elegido funciona
-        if chosen is not None:
-            print(f"[VOZ] Verificando micrófono [{chosen}]...")
-            if _test_microphone(chosen):
-                print(f"[VOZ] ✓ Micrófono [{chosen}] funcional.")
+        saved = os.getenv("MICROPHONE_INDEX", "").strip()
+        if saved.lstrip("-").isdigit():
+            chosen = int(saved)
+            if chosen >= 0:
+                print(f"[VOZ] Usando micrófono configurado por entorno: [{chosen}]")
                 return chosen
-            else:
-                print(f"[VOZ] ✗ Micrófono [{chosen}] no funciona. Probando dispositivo por defecto...")
-
-        # Intentar con el dispositivo por defecto
-        if _test_microphone(None):
-            print("[VOZ] ✓ Dispositivo por defecto funcional.")
+            print("[VOZ] Usando dispositivo por defecto del sistema.")
             return None
 
-        print("[VOZ] ⚠ No se pudo verificar ningún micrófono. Se intentará igualmente.")
-        return chosen
+        print("[VOZ] Usando dispositivo por defecto del sistema.")
+        if _test_microphone(None):
+            print("[VOZ] ✓ Dispositivo por defecto funcional.")
+        else:
+            print("[VOZ] ⚠ No se pudo verificar el micrófono predeterminado. Se intentará igualmente.")
+        return None
 
     def _load_whisper(self):
         """Carga el modelo Whisper (offline) la primera vez."""

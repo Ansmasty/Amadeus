@@ -18,12 +18,13 @@ from colorlog import ColoredFormatter
 import logging
 
 from dotenv import load_dotenv
-
+import re
 load_dotenv()
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
 def _setup_logging():
+
     handler = logging.StreamHandler()
     handler.setFormatter(ColoredFormatter(
         "%(log_color)s[%(levelname)s]%(reset)s %(message)s",
@@ -46,6 +47,8 @@ log = logging.getLogger("amadeus")
 # ─── Imports del agente ───────────────────────────────────────────────────────
 
 from agent.core import create_agent, check_ollama_connection
+from agent.tools.browser import open_url
+from agent.tools.system_apps import open_application, open_system_settings, open_file_explorer
 from agent.hitl import (
     CONFIRMATION_SENTINEL,
     PendingAction,
@@ -62,7 +65,7 @@ BANNER = r"""
    /   |  /  |/ /   \  / __ \/ ____/ / / ___/
   / /| | / /|_/ / /| | / / / / __/ / / /\__ \ 
  / ___ |/ /  / / ___ |/ /_/ / /___/ /_/ /__/ / 
-/_/  |_/_/  /_/_/  |_/_____/_____/\____/____/  
+/_/  |_|/_/  /_/_/  |_/_____/_____\____/____/  
 
         Asistente de IA Local — 100% Privado
 """
@@ -70,6 +73,29 @@ BANNER = r"""
 EXIT_COMMANDS  = {"salir", "exit", "quit", "adiós", "adios", "bye"}
 CANCEL_PHRASES = {"cancelar", "cancel", "no", "cancela"}
 CONFIRM_PHRASES = {"confirmar", "confirm", "sí", "si", "yes", "adelante", "procede"}
+
+WEB_APP_MAP = {
+    "instagram": "https://www.instagram.com",
+    "insta": "https://www.instagram.com",
+    "youtube": "https://www.youtube.com",
+    "youtube music": "https://music.youtube.com",
+    "gmail": "https://mail.google.com",
+    "google": "https://www.google.com",
+    "twitter": "https://x.com",
+    "x": "https://x.com",
+    "facebook": "https://www.facebook.com",
+    "whatsapp web": "https://web.whatsapp.com",
+    "reddit": "https://www.reddit.com",
+    "linkedin": "https://www.linkedin.com",
+    "discord web": "https://discord.com/app",
+    "spotify web": "https://open.spotify.com",
+}
+
+SYSTEM_PANEL_KEYWORDS = {
+    "wifi", "bluetooth", "pantalla", "display", "sonido", "sound",
+    "privacidad", "updates", "actualizaciones", "apps", "aplicaciones",
+    "explorador", "explorer", "file explorer",
+}
 
 
 # ─── Clase principal ──────────────────────────────────────────────────────────
@@ -187,6 +213,8 @@ class AmadeusApp:
             if pending:
                 self._handle_confirmation(pending, stripped)
             else:
+                if self._maybe_handle_direct_command(user_input):
+                    continue
                 self._run_agent(user_input)
 
     # ─── Entrada de usuario ───────────────────────────────────────────────────
@@ -237,6 +265,43 @@ class AmadeusApp:
             )
             print(f"\n🤖 AMADEUS: {reminder}")
             self._speak(reminder)
+
+    def _maybe_handle_direct_command(self, user_input: str) -> bool:
+        """Ejecuta comandos de apertura sin pasar por el modelo."""
+        normalized = re.sub(r"\s+", " ", user_input.strip().lower())
+        match = re.match(r"^(abre|abrir|open|launch|lanzar)\s+(.+)$", normalized)
+        if not match:
+            return False
+
+        target = match.group(2).strip()
+        target = re.sub(r"^(la|el|los|las|the|my|mi|mis)\s+", "", target)
+
+        if target in WEB_APP_MAP:
+            result = open_url.invoke({"url": WEB_APP_MAP[target]})
+            self._announce_direct_action(target, result)
+            return True
+
+        if target in SYSTEM_PANEL_KEYWORDS:
+            result = open_system_settings.invoke({"setting": target})
+            self._announce_direct_action(target, result)
+            return True
+
+        if target in {"explorador", "explorer", "file explorer"}:
+            result = open_file_explorer.invoke({"path": ""})
+            self._announce_direct_action(target, result)
+            return True
+
+        result = open_application.invoke({"app_name": target})
+        self._announce_direct_action(target, result)
+        return True
+
+    def _announce_direct_action(self, target: str, result: str) -> None:
+        if result.startswith("✓") or result.startswith("Opened") or result.startswith("Abierto"):
+            message = f"He abierto {target}."
+        else:
+            message = f"No pude abrir {target}."
+        print(f"\n🤖 AMADEUS: {message}")
+        self._speak(message)
 
     # ─── Invocación del agente ────────────────────────────────────────────────
 
@@ -362,8 +427,6 @@ class AmadeusApp:
             pass
         return None
 
-# ─── Entry Point ──────────────────────────────────────────────────────────────
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="AMADEUS — Asistente de IA Local"
@@ -389,7 +452,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="INDEX",
         help="Índice del micrófono a usar (evita el menú de selección). "
-             "Usa --list-mics para ver los índices disponibles."
+            "Usa --list-mics para ver los índices disponibles."
     )
     parser.add_argument(
         "--list-mics",
