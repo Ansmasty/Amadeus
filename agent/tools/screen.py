@@ -19,7 +19,7 @@ from langchain_core.tools import tool
 _MAX_OCR_CHARS = 6000
 
 
-def _grab_screenshot():
+def grab_screenshot():
     """Captura la pantalla completa y devuelve un objeto PIL.Image."""
     from PIL import ImageGrab
     return ImageGrab.grab()
@@ -63,7 +63,7 @@ def read_screen_text() -> str:
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
 
     try:
-        image = _grab_screenshot()
+        image = grab_screenshot()
     except Exception as exc:
         return f"Error al capturar la pantalla: {exc}"
 
@@ -86,19 +86,15 @@ def read_screen_text() -> str:
     return f"Texto detectado en pantalla:\n\n{text}"
 
 
-# ─── Visión: descripción de la pantalla con modelo multimodal ────────────────
+# ─── Visión: análisis de una imagen con modelo multimodal ────────────────────
+# Función pública reutilizable: la usa tanto la tool `describe_screen` (con una
+# captura en vivo) como gui.py (con una imagen adjuntada o capturada desde la UI).
 
 
-@tool
-def describe_screen(question: str = "") -> str:
+def analyze_image(image, question: str = "") -> str:
     """
-    Captura la pantalla actual y la analiza con un modelo de IA con visión
-    (local, vía Ollama). Úsala cuando el usuario pida entender algo visual
-    que el OCR no puede capturar bien: layout de una interfaz, un gráfico,
-    un diagrama, colores, o para responder preguntas generales sobre lo que
-    se ve en pantalla ("¿qué estoy viendo?", "describe esta ventana").
-    Si el usuario no da una pregunta específica, describe la pantalla en general.
-    Requiere tener un modelo multimodal descargado en Ollama (ver .env: OLLAMA_VISION_MODEL).
+    Analiza una imagen PIL con el modelo multimodal configurado en Ollama.
+    Devuelve la respuesta del modelo como texto (o un mensaje de error legible).
     """
     from langchain_core.messages import HumanMessage
     from langchain_ollama import ChatOllama
@@ -107,19 +103,15 @@ def describe_screen(question: str = "") -> str:
     vision_model = os.getenv("OLLAMA_VISION_MODEL", "llava")
 
     try:
-        image = _grab_screenshot()
-    except Exception as exc:
-        return f"Error al capturar la pantalla: {exc}"
-
-    try:
         img_b64 = _screenshot_to_base64_png(image)
     except Exception as exc:
-        return f"Error al procesar la captura: {exc}"
+        return f"Error al procesar la imagen: {exc}"
 
     prompt_text = question.strip() or (
-        "Describe brevemente lo que se ve en esta captura de pantalla: "
+        "Describe brevemente lo que se ve en esta imagen: "
         "qué aplicación o ventana está abierta, y cualquier elemento relevante "
-        "(código, errores, texto importante, gráficos)."
+        "(código, errores, texto importante, gráficos). Si hay código visible, "
+        "transcríbelo lo más fielmente posible."
     )
 
     try:
@@ -140,7 +132,26 @@ def describe_screen(question: str = "") -> str:
         return result
     except Exception as exc:
         return (
-            f"Error al analizar la pantalla con el modelo de visión: {exc}\n"
+            f"Error al analizar la imagen con el modelo de visión: {exc}\n"
             f"Verifica que el modelo '{vision_model}' esté descargado "
             f"(ejecuta: ollama pull {vision_model}) y que Ollama esté corriendo."
         )
+
+
+@tool
+def describe_screen(question: str = "") -> str:
+    """
+    Captura la pantalla actual y la analiza con un modelo de IA con visión
+    (local, vía Ollama). Úsala cuando el usuario pida entender algo visual
+    que el OCR no puede capturar bien: layout de una interfaz, un gráfico,
+    un diagrama, colores, o para responder preguntas generales sobre lo que
+    se ve en pantalla ("¿qué estoy viendo?", "describe esta ventana").
+    Si el usuario no da una pregunta específica, describe la pantalla en general.
+    Requiere tener un modelo multimodal descargado en Ollama (ver .env: OLLAMA_VISION_MODEL).
+    """
+    try:
+        image = grab_screenshot()
+    except Exception as exc:
+        return f"Error al capturar la pantalla: {exc}"
+
+    return analyze_image(image, question)

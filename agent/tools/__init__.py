@@ -7,6 +7,8 @@ from agent.tools.filesystem import (
     list_directory,
     read_file,
     create_directory,
+    write_file,
+    edit_file,
     delete_file,
     move_file,
     copy_file,
@@ -43,6 +45,8 @@ ALL_TOOLS = [
     # Filesystem - non-destructive write
     create_directory,
     # Filesystem - destructive (HITL required)
+    write_file,
+    edit_file,
     delete_file,
     move_file,
     copy_file,

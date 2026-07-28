@@ -17,15 +17,18 @@ import queue
 import re
 import threading
 import uuid
+from tkinter import filedialog
 
 import customtkinter as ctk
 from dotenv import load_dotenv
+from PIL import Image
 
 load_dotenv()
 
 from agent.core import create_agent, check_ollama_connection
 from agent.tools.browser import open_url
 from agent.tools.system_apps import open_application, open_system_settings, open_file_explorer
+from agent.tools.screen import analyze_image, grab_screenshot
 from agent.hitl import (
     PendingAction,
     cancel,
@@ -83,7 +86,7 @@ ctk.set_default_color_theme("blue")
 class MessageBubble(ctk.CTkFrame):
     """Una burbuja de chat individual (usuario, Amadeus o etiqueta de herramienta)."""
 
-    def __init__(self, master, role: str, text: str = ""):
+    def __init__(self, master, role: str, text: str = "", thumbnail: "ctk.CTkImage | None" = None):
         super().__init__(master, fg_color="transparent")
         self.role = role
         is_user = role == "user"
@@ -106,13 +109,21 @@ class MessageBubble(ctk.CTkFrame):
             font=ctk.CTkFont(size=11, weight="bold"), anchor="w",
         ).grid(row=0, column=0, sticky="w", padx=12, pady=(8, 0))
 
+        next_row = 1
+        if thumbnail is not None:
+            img_label = ctk.CTkLabel(self.bubble, image=thumbnail, text="")
+            img_label.image = thumbnail  # evita garbage collection
+            img_label.grid(row=next_row, column=0, sticky="w", padx=12, pady=(4, 2))
+            next_row += 1
+
+        self._text_row = next_row
         self.text_var = ctk.StringVar(value=text)
         self.text_label = ctk.CTkLabel(
             self.bubble, textvariable=self.text_var, text_color=TEXT_MAIN,
             font=ctk.CTkFont(size=13), justify="left", anchor="w",
             wraplength=560,
         )
-        self.text_label.grid(row=1, column=0, sticky="w", padx=12, pady=(2, 10))
+        self.text_label.grid(row=next_row, column=0, sticky="w", padx=12, pady=(2, 10))
 
     def append(self, chunk: str) -> None:
         self.text_var.set(self.text_var.get() + chunk)
@@ -145,10 +156,13 @@ class AmadeusGUI(ctk.CTk):
         self._ui_queue: "queue.Queue[tuple]" = queue.Queue()
         self._current_bubble: MessageBubble | None = None
         self._current_tool: str | None = None
+        self._pending_image: "Image.Image | None" = None
+        self._pending_image_label: str = ""
 
         self._build_header()
         self._build_chat_area()
         self._build_confirmation_bar()
+        self._build_attachment_bar()
         self._build_input_bar()
 
         self.after(150, self._poll_queue)
@@ -213,6 +227,26 @@ class AmadeusGUI(ctk.CTk):
         # Oculto hasta que haya una acción pendiente
         self.confirm_bar.pack_forget()
 
+    def _build_attachment_bar(self) -> None:
+        self.attach_bar = ctk.CTkFrame(self, fg_color=BG_PANEL, corner_radius=10)
+
+        self.attach_thumb_label = ctk.CTkLabel(self.attach_bar, text="", image=None)
+        self.attach_thumb_label.pack(side="left", padx=(10, 8), pady=8)
+
+        self.attach_name_label = ctk.CTkLabel(
+            self.attach_bar, text="", text_color=TEXT_DIM,
+            font=ctk.CTkFont(size=11), anchor="w",
+        )
+        self.attach_name_label.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        ctk.CTkButton(
+            self.attach_bar, text="✕", width=28, height=28, fg_color=BG_INPUT,
+            hover_color=ERROR_COLOR, command=self._clear_attachment,
+        ).pack(side="right", padx=10, pady=8)
+
+        # Oculto hasta que se adjunte una imagen
+        self.attach_bar.pack_forget()
+
     def _build_input_bar(self) -> None:
         self.input_bar = ctk.CTkFrame(self, fg_color=BG_PANEL, corner_radius=0, height=64)
         self.input_bar.pack(side="bottom", fill="x")
@@ -222,7 +256,19 @@ class AmadeusGUI(ctk.CTk):
             self.input_bar, text="🎤", width=44, height=40, fg_color=BG_INPUT,
             hover_color=ACCENT_DIM, command=self._on_mic_click,
         )
-        self.mic_button.pack(side="left", padx=(14, 6), pady=12)
+        self.mic_button.pack(side="left", padx=(14, 4), pady=12)
+
+        self.attach_button = ctk.CTkButton(
+            self.input_bar, text="📎", width=40, height=40, fg_color=BG_INPUT,
+            hover_color=ACCENT_DIM, command=self._on_attach_click,
+        )
+        self.attach_button.pack(side="left", padx=4, pady=12)
+
+        self.capture_button = ctk.CTkButton(
+            self.input_bar, text="📷", width=40, height=40, fg_color=BG_INPUT,
+            hover_color=ACCENT_DIM, command=self._on_capture_click,
+        )
+        self.capture_button.pack(side="left", padx=(4, 6), pady=12)
 
         self.entry = ctk.CTkEntry(
             self.input_bar, placeholder_text="Escribe tu mensaje…", height=40,
@@ -294,6 +340,9 @@ class AmadeusGUI(ctk.CTk):
             _, text, color = event
             self._set_status(text, color)
 
+        elif kind == "status_only":
+            self._set_status(event[1], TOOL_TAG)
+
         elif kind == "system":
             self._add_system_note(event[1])
 
@@ -340,10 +389,19 @@ class AmadeusGUI(ctk.CTk):
 
     def _on_send_click(self) -> None:
         text = self.entry.get().strip()
-        if not text or self.agent is None:
+        if self.agent is None:
+            return
+        if not text and self._pending_image is None:
             return
         self.entry.delete(0, "end")
-        self._dispatch_user_message(text)
+
+        if self._pending_image is not None:
+            image = self._pending_image
+            label = self._pending_image_label
+            self._clear_attachment()
+            self._dispatch_user_message_with_image(text, image, label)
+        else:
+            self._dispatch_user_message(text)
 
     def _dispatch_user_message(self, text: str) -> None:
         bubble = MessageBubble(self.chat_frame, role="user", text=text)
@@ -389,6 +447,94 @@ class AmadeusGUI(ctk.CTk):
         self._ui_queue.put(("token", message))
         self._speak(message)
         return True
+
+    # ─── Adjuntos (imagen / captura de pantalla) ───────────────────────────────
+
+    def _on_attach_click(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Selecciona una imagen",
+            filetypes=[("Imágenes", "*.png *.jpg *.jpeg *.bmp *.webp"), ("Todos los archivos", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            image = Image.open(path).convert("RGB")
+        except Exception as exc:
+            self._add_system_note(f"❌ No se pudo abrir la imagen: {exc}", color=ERROR_COLOR)
+            return
+        name = os.path.basename(path)
+        self._set_pending_image(image, f"📎 {name}")
+
+    def _on_capture_click(self) -> None:
+        # Minimiza la ventana un instante para no capturarse a sí misma,
+        # así se ve lo que hay detrás (editor, navegador, etc.)
+        self.iconify()
+        self.after(280, self._do_capture)
+
+    def _do_capture(self) -> None:
+        try:
+            image = grab_screenshot()
+        except Exception as exc:
+            self.deiconify()
+            self._add_system_note(f"❌ No se pudo capturar la pantalla: {exc}", color=ERROR_COLOR)
+            return
+        self.deiconify()
+        self._set_pending_image(image, "📷 Captura de pantalla")
+
+    def _set_pending_image(self, image: "Image.Image", label: str) -> None:
+        self._pending_image = image
+        self._pending_image_label = label
+
+        thumb = image.copy()
+        thumb.thumbnail((72, 48))
+        ctk_thumb = ctk.CTkImage(light_image=thumb, dark_image=thumb, size=thumb.size)
+        self.attach_thumb_label.configure(image=ctk_thumb)
+        self.attach_thumb_label.image = ctk_thumb
+        self.attach_name_label.configure(text=f"{label} — se enviará junto a tu mensaje")
+
+        self.attach_bar.pack(side="bottom", fill="x", padx=14, pady=(0, 6), before=self.input_bar)
+        self.entry.focus_set()
+
+    def _clear_attachment(self) -> None:
+        self._pending_image = None
+        self._pending_image_label = ""
+        self.attach_bar.pack_forget()
+
+    def _dispatch_user_message_with_image(self, text: str, image: "Image.Image", label: str) -> None:
+        thumb = image.copy()
+        thumb.thumbnail((220, 160))
+        ctk_thumb = ctk.CTkImage(light_image=thumb, dark_image=thumb, size=thumb.size)
+
+        bubble = MessageBubble(
+            self.chat_frame, role="user", text=text or "(analiza esta imagen)",
+            thumbnail=ctk_thumb,
+        )
+        bubble.grid(row=self._row, column=0, sticky="ew", pady=2)
+        self._row += 1
+        self._scroll_to_bottom()
+
+        self._set_busy("Analizando imagen…")
+        threading.Thread(
+            target=self._run_agent_worker_with_image, args=(text, image), daemon=True,
+        ).start()
+
+    def _run_agent_worker_with_image(self, text: str, image: "Image.Image") -> None:
+        vision_result = analyze_image(image, question=text)
+
+        if text.strip():
+            combined = (
+                f"El usuario adjuntó una imagen y preguntó: «{text.strip()}»\n\n"
+                f"[Análisis del modelo de visión sobre la imagen]:\n{vision_result}"
+            )
+        else:
+            combined = (
+                "El usuario adjuntó una imagen sin pregunta específica. "
+                f"Analízala y responde de forma útil.\n\n"
+                f"[Análisis del modelo de visión sobre la imagen]:\n{vision_result}"
+            )
+
+        self._ui_queue.put(("status_only", "AMADEUS está pensando…"))
+        self._run_agent_worker(combined)
 
     # ─── Invocación del agente (hilo de trabajo) ──────────────────────────────
 
