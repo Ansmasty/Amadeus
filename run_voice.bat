@@ -5,5 +5,10 @@ if exist .venv310\Scripts\activate.bat (
 	call .venv310\Scripts\activate.bat
 )
 
-py -3.10 -X utf8 main.py --voice
+where py >nul 2>&1
+if %errorlevel%==0 (
+	py -3.10 -X utf8 main.py --voice
+) else (
+	python -X utf8 main.py --voice
+)
 pause
