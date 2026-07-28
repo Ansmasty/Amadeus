@@ -133,6 +133,121 @@ def create_directory(path: str) -> str:
         return f"Error creating directory: {exc}"
 
 
+@tool
+def write_file(path: str, content: str) -> str:
+    """
+    Create a new file with the given content, or overwrite an existing one.
+    Use this for full rewrites (e.g., generating a new script) or when the
+    user explicitly wants to replace an entire file's contents.
+    For small, targeted changes to an existing file, prefer `edit_file`
+    instead — it's safer because it only touches the specific part that changed.
+    WARNING: overwriting an EXISTING file is DESTRUCTIVE and requires user
+    confirmation. Creating a brand-new file does not.
+    Example: write_file("C:/Proyectos/mi-app/utils.py", "def suma(a, b):\\n    return a + b\\n")
+    """
+    try:
+        validated = validate_path(path)
+    except PathSecurityError as exc:
+        return f"Security error: {exc}"
+
+    if validated.is_dir():
+        return f"Error: '{validated}' is a directory, not a file."
+
+    file_exists = validated.exists()
+
+    if file_exists:
+        action_key = f"write:{validated}:{hash(content)}"
+        if not is_confirmed(action_key):
+            try:
+                preview = validated.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                preview = "(no se pudo leer el contenido actual)"
+            register_pending(
+                key=action_key,
+                description=(
+                    f"Sobrescribir el archivo '{validated.name}' "
+                    f"({len(preview.splitlines())} líneas actuales → "
+                    f"{len(content.splitlines())} líneas nuevas)?"
+                ),
+                action_type="write_file",
+                params={"path": str(validated), "content_preview": content[:500]},
+            )
+            return CONFIRMATION_SENTINEL
+
+    try:
+        validated.parent.mkdir(parents=True, exist_ok=True)
+        validated.write_text(content, encoding="utf-8")
+        verb = "sobrescrito" if file_exists else "creado"
+        return f"Archivo {verb} correctamente: {validated} ({len(content.splitlines())} líneas)"
+    except PermissionError:
+        return f"Error: Permission denied writing to: {validated}"
+    except Exception as exc:
+        return f"Error writing file: {exc}"
+
+
+@tool
+def edit_file(path: str, find: str, replace: str, count: int = 1) -> str:
+    """
+    Make a targeted edit to an existing file: replaces an exact snippet of
+    text ('find') with new text ('replace'), leaving the rest of the file
+    untouched. Prefer this over `write_file` for small changes (fixing a
+    bug, renaming a variable, adding a parameter) since it's safer and lets
+    the user review exactly what changes.
+    'find' must match the file's content EXACTLY (including whitespace/indentation) —
+    read the file first with `read_file` to copy the exact snippet.
+    'count' limits how many occurrences to replace (default 1, use -1 for all).
+    WARNING: this is a DESTRUCTIVE operation and requires user confirmation.
+    Example: edit_file("C:/Proyectos/mi-app/main.py", "def old_name():", "def new_name():")
+    """
+    try:
+        validated = validate_path(path)
+    except PathSecurityError as exc:
+        return f"Security error: {exc}"
+
+    if not validated.exists() or not validated.is_file():
+        return f"Error: File does not exist: {validated}"
+
+    from security.validators import get_max_file_size_bytes
+    max_bytes = get_max_file_size_bytes()
+    try:
+        if validated.stat().st_size > max_bytes:
+            return f"Error: File too large to edit safely ({validated.stat().st_size:,} bytes)."
+        original = validated.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return f"Error reading file: {exc}"
+
+    occurrences = original.count(find)
+    if occurrences == 0:
+        return (
+            "Error: no se encontró el texto indicado en el archivo. "
+            "Vuelve a leer el archivo con read_file y copia el fragmento exacto."
+        )
+
+    replacements = occurrences if count == -1 else min(count, occurrences)
+    new_content = original.replace(find, replace, replacements) if count != -1 else original.replace(find, replace)
+
+    action_key = f"edit:{validated}:{hash(find)}:{hash(replace)}"
+    if not is_confirmed(action_key):
+        register_pending(
+            key=action_key,
+            description=(
+                f"Editar '{validated.name}': reemplazar "
+                f"{replacements} ocurrencia(s) de:\n  «{find[:120]}»\npor:\n  «{replace[:120]}»"
+            ),
+            action_type="edit_file",
+            params={"path": str(validated), "find": find[:300], "replace": replace[:300]},
+        )
+        return CONFIRMATION_SENTINEL
+
+    try:
+        validated.write_text(new_content, encoding="utf-8")
+        return f"Archivo editado correctamente: {validated} ({replacements} reemplazo(s))"
+    except PermissionError:
+        return f"Error: Permission denied writing to: {validated}"
+    except Exception as exc:
+        return f"Error writing file: {exc}"
+
+
 # ─── Destructive Tools (HITL required) ───────────────────────────────────────
 
 

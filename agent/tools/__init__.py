@@ -7,6 +7,8 @@ from agent.tools.filesystem import (
     list_directory,
     read_file,
     create_directory,
+    write_file,
+    edit_file,
     delete_file,
     move_file,
     copy_file,
@@ -27,6 +29,14 @@ from agent.tools.system_info import (
     get_weather,
     calculate,
 )
+from agent.tools.screen import read_screen_text, describe_screen
+from agent.tools.dev import (
+    git_status,
+    git_diff,
+    git_log,
+    search_in_project,
+    run_terminal_command,
+)
 
 ALL_TOOLS = [
     # Filesystem - read-only
@@ -35,6 +45,8 @@ ALL_TOOLS = [
     # Filesystem - non-destructive write
     create_directory,
     # Filesystem - destructive (HITL required)
+    write_file,
+    edit_file,
     delete_file,
     move_file,
     copy_file,
@@ -56,6 +68,15 @@ ALL_TOOLS = [
     get_battery_status,
     get_weather,
     calculate,
+    # Pantalla — percepción visual
+    read_screen_text,
+    describe_screen,
+    # Desarrollo — git, búsqueda en proyecto, terminal (destructivo)
+    git_status,
+    git_diff,
+    git_log,
+    search_in_project,
+    run_terminal_command,
 ]
 
 __all__ = ["ALL_TOOLS"]
