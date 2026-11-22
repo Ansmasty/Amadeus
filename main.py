@@ -1,7 +1,8 @@
 """
 main.py
 
-AMADEUS - Asistente de IA Local con entrada/salida por voz.
+AMADEUS - Asistente de IA con arquitectura LLM dual (Ollama local / Gemini en la nube)
+y soporte de entrada/salida por voz.
 Ejecutar con: run.bat  o  python main.py
 
 Modos disponibles:
@@ -10,71 +11,94 @@ Modos disponibles:
   - Voz+Texto:  python main.py --voice --text-fallback
 """
 import argparse
+import logging
 import os
+import re
 import sys
 import uuid
+from typing import Any, Dict, List, Optional, Set
 
 from colorlog import ColoredFormatter
-import logging
-
 from dotenv import load_dotenv
-import re
+from langchain_core.language_models.chat_models import BaseChatModel
+
 load_dotenv()
 
-# ─── Logging ──────────────────────────────────────────────────────────────────
 
-def _setup_logging():
+# ─── Configuración de Logging ─────────────────────────────────────────────────
 
-    handler = logging.StreamHandler()
-    handler.setFormatter(ColoredFormatter(
-        "%(log_color)s[%(levelname)s]%(reset)s %(message)s",
-        log_colors={
-            "DEBUG": "cyan",
-            "INFO": "green",
-            "WARNING": "yellow",
-            "ERROR": "red",
-            "CRITICAL": "bold_red",
-        }
-    ))
-    root = logging.getLogger()
-    root.setLevel(logging.WARNING)  # Silencia logs de LangChain/httpx
+
+def configurar_registro_logs() -> None:
+    """Configura el formateador de logs con colores en consola."""
+    manejador = logging.StreamHandler()
+    manejador.setFormatter(
+        ColoredFormatter(
+            "%(log_color)s[%(levelname)s]%(reset)s %(message)s",
+            log_colors={
+                "DEBUG": "cyan",
+                "INFO": "green",
+                "WARNING": "yellow",
+                "ERROR": "red",
+                "CRITICAL": "bold_red",
+            },
+        )
+    )
+    logger_raiz = logging.getLogger()
+    logger_raiz.setLevel(logging.WARNING)  # Silencia logs de LangChain/httpx
     logging.getLogger("amadeus").setLevel(logging.INFO)
-    root.addHandler(handler)
+    logger_raiz.addHandler(manejador)
 
-_setup_logging()
-log = logging.getLogger("amadeus")
+
+configurar_registro_logs()
+registro_log = logging.getLogger("amadeus")
 
 # ─── Imports del agente ───────────────────────────────────────────────────────
 
-from agent.core import create_agent, check_ollama_connection
-from agent.tools.browser import open_url
-from agent.tools.system_apps import open_application, open_system_settings, open_file_explorer
-from agent.hitl import (
-    CONFIRMATION_SENTINEL,
+from agent.core import crear_agente, verificar_conexion_ollama  # noqa: E402
+from agent.hitl import (  # noqa: E402
     PendingAction,
     cancel,
     confirm,
     get_pending_action,
     reset_all,
 )
+from agent.llm_factory import (  # noqa: E402
+    PROVEEDOR_GEMINI,
+    PROVEEDOR_LOCAL,
+    crear_modelo_llm,
+)
+from agent.tools.browser import open_url  # noqa: E402
+from agent.tools.system_apps import (  # noqa: E402
+    open_application,
+    open_file_explorer,
+    open_system_settings,
+)
 
 # ─── Constantes ───────────────────────────────────────────────────────────────
 
-BANNER = r"""
+BANNER: str = r"""
     ___    __  ______    ____  _______  _______
    /   |  /  |/ /   \  / __ \/ ____/ / / ___/
   / /| | / /|_/ / /| | / / / / __/ / / /\__ \ 
  / ___ |/ /  / / ___ |/ /_/ / /___/ /_/ /__/ / 
 /_/  |_|/_/  /_/_/  |_/_____/_____\____/____/  
 
-        Asistente de IA Local — 100% Privado
+        Asistente de IA — Arquitectura Dual (Local / Nube)
 """
 
-EXIT_COMMANDS  = {"salir", "exit", "quit", "adiós", "adios", "bye"}
-CANCEL_PHRASES = {"cancelar", "cancel", "no", "cancela"}
-CONFIRM_PHRASES = {"confirmar", "confirm", "sí", "si", "yes", "adelante", "procede"}
+COMANDOS_SALIDA: Set[str] = {"salir", "exit", "quit", "adiós", "adios", "bye"}
+FRASES_CANCELACION: Set[str] = {"cancelar", "cancel", "no", "cancela"}
+FRASES_CONFIRMACION: Set[str] = {
+    "confirmar",
+    "confirm",
+    "sí",
+    "si",
+    "yes",
+    "adelante",
+    "procede",
+}
 
-WEB_APP_MAP = {
+MAPA_APLICACIONES_WEB: Dict[str, str] = {
     "instagram": "https://www.instagram.com",
     "insta": "https://www.instagram.com",
     "youtube": "https://www.youtube.com",
@@ -91,52 +115,138 @@ WEB_APP_MAP = {
     "spotify web": "https://open.spotify.com",
 }
 
-SYSTEM_PANEL_KEYWORDS = {
-    "wifi", "bluetooth", "pantalla", "display", "sonido", "sound",
-    "privacidad", "updates", "actualizaciones", "apps", "aplicaciones",
-    "explorador", "explorer", "file explorer",
+PALABRAS_CLAVE_PANEL_SISTEMA: Set[str] = {
+    "wifi",
+    "bluetooth",
+    "pantalla",
+    "display",
+    "sonido",
+    "sound",
+    "privacidad",
+    "updates",
+    "actualizaciones",
+    "apps",
+    "aplicaciones",
+    "explorador",
+    "explorer",
+    "file explorer",
 }
 
 
-# ─── Clase principal ──────────────────────────────────────────────────────────
+# ─── Menú CLI de Selección de Proveedor LLM ──────────────────────────────────
 
-class AmadeusApp:
-    def __init__(self, voice_mode: bool = False, text_fallback: bool = False):
-        self.voice_mode = voice_mode
-        self.text_fallback = text_fallback
-        self.thread_id = str(uuid.uuid4())
-        self.agent = None
+
+def seleccionar_proveedor_llm() -> str:
+    """
+    Muestra un menú interactivo en consola para que el usuario elija el motor LLM.
+
+    Returns:
+        str: Proveedor seleccionado ("local" para Ollama o "gemini" para Google AI).
+    """
+    modelo_local: str = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+    modelo_gemini: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+    print("─" * 60)
+    print("🧠 Selección de Motor de Inteligencia Artificial:")
+    print(f"  [1] Modelo Local (Ollama - {modelo_local})")
+    print(f"  [2] Modelo Gemini (Google AI - {modelo_gemini})")
+    print("─" * 60)
+
+    while True:
+        try:
+            opcion: str = input(
+                "Selecciona una opción [1/2] (por defecto 1): "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n\n👋 Saliendo de AMADEUS.")
+            sys.exit(0)
+
+        if opcion in {"", "1", "local", "ollama"}:
+            return PROVEEDOR_LOCAL
+        if opcion in {"2", "gemini", "google", "google ai"}:
+            return PROVEEDOR_GEMINI
+
+        print("⚠️  Opción no válida. Por favor, ingresa '1' (Local) o '2' (Gemini).")
+
+
+# ─── Clase Principal de la Aplicación ────────────────────────────────────────
+
+
+class AplicacionAmadeus:
+    """Controlador principal de la interfaz de línea de comandos de AMADEUS."""
+
+    def __init__(
+        self,
+        modo_voz: bool = False,
+        respaldo_texto: bool = False,
+        proveedor_llm: Optional[str] = None,
+    ) -> None:
+        self.modo_voz: bool = modo_voz
+        self.respaldo_texto: bool = respaldo_texto
+        self.proveedor_llm: Optional[str] = proveedor_llm
+        self.id_hilo: str = str(uuid.uuid4())
+        self.agente: Any = None
 
         # Componentes de voz (se inicializan solo si se necesitan)
-        self._voice_input = None
-        self._voice_output = None
+        self._entrada_voz: Any = None
+        self._salida_voz: Any = None
 
     # ─── Inicialización ───────────────────────────────────────────────────────
 
-    def setup(self) -> bool:
-        """Inicializa el agente y los componentes de voz. Retorna False si falla."""
+    def inicializar(self) -> bool:
+        """
+        Inicializa el modelo LLM seleccionado, el agente y los componentes de voz.
+
+        Returns:
+            bool: True si la inicialización fue exitosa, False en caso de error.
+        """
         print(BANNER)
 
-        base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-        model    = os.getenv("OLLAMA_MODEL", "llama3.2:3b")   # ← cambiado
+        proveedor: str = self.proveedor_llm or seleccionar_proveedor_llm()
+        self.proveedor_llm = proveedor
 
-        print(f"[*] Conectando con Ollama ({model})...")
-        ok, msg = check_ollama_connection(base_url, model)
-        if not ok:
-            print(f"\n❌ Error de conexión:\n{msg}")
+        if proveedor == PROVEEDOR_LOCAL:
+            url_base: str = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+            nombre_modelo: str = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+
+            print(f"\n[*] Conectando con Ollama ({nombre_modelo})...")
+            conectado, mensaje_conexion = verificar_conexion_ollama(
+                url_base,
+                nombre_modelo,
+            )
+            if not conectado:
+                print(f"\n❌ Error de conexión:\n{mensaje_conexion}")
+                return False
+            print(f"[✓] Ollama conectado — modelo: {nombre_modelo}")
+        else:
+            nombre_modelo = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+            print(f"\n[*] Configurando Modelo Gemini ({nombre_modelo})...")
+
+        try:
+            modelo_llm: BaseChatModel = crear_modelo_llm(proveedor)
+        except ValueError as exc:
+            print(f"\n❌ Error de configuración del modelo:\n{exc}")
             return False
-        print(f"[✓] Ollama conectado — modelo: {model}")
+        except Exception as exc:
+            print(f"\n❌ Error inesperado al instanciar el modelo LLM:\n{exc}")
+            return False
 
-        # Crear agente
-        self.agent, _, _ = create_agent()
+        if proveedor == PROVEEDOR_GEMINI:
+            print(f"[✓] Gemini configurado — modelo: {nombre_modelo}")
+
+        # Inyectar el modelo seleccionado en el núcleo del agente
+        self.agente, _, _ = crear_agente(
+            modelo_llm=modelo_llm,
+            proveedor=proveedor,
+        )
         print("[✓] Agente AMADEUS listo")
 
-        # Inicializar voz
-        if self.voice_mode:
-            self._init_voice()
+        # Inicializar voz si corresponde
+        if self.modo_voz:
+            self._inicializar_voz()
 
         print("\n" + "─" * 60)
-        if self.voice_mode:
+        if self.modo_voz:
             print("🎤 Modo VOZ activado. Habla para interactuar con AMADEUS.")
         else:
             print("⌨️  Modo TEXTO. Escribe tu mensaje y pulsa Enter.")
@@ -145,94 +255,92 @@ class AmadeusApp:
 
         return True
 
-    def _init_voice(self):
-        """Inicializa los módulos de voz."""
+    def _inicializar_voz(self) -> None:
+        """Inicializa los módulos de síntesis y reconocimiento de voz."""
         print("[*] Inicializando síntesis de voz...")
         try:
             from voice.output import VoiceOutput
-            self._voice_output = VoiceOutput()
+
+            self._salida_voz = VoiceOutput()
             print("[✓] Síntesis de voz lista")
         except Exception as exc:
             print(f"[!] No se pudo inicializar la voz: {exc}")
-            self._voice_output = None
+            self._salida_voz = None
 
         print("[*] Inicializando reconocimiento de voz...")
         try:
             from voice.input import VoiceInput
-            self._voice_input = VoiceInput()
+
+            self._entrada_voz = VoiceInput()
             print("[✓] Reconocimiento de voz listo")
         except Exception as exc:
             print(f"[!] No se pudo inicializar el micrófono: {exc}")
-            self._voice_input = None
-            if not self.text_fallback:
-                print("[!] Activando fallback a texto.")
-                self.text_fallback = True
+            self._entrada_voz = None
+            if not self.respaldo_texto:
+                print("[!] Activando respaldo a entrada por texto.")
+                self.respaldo_texto = True
 
     # ─── Síntesis de voz ──────────────────────────────────────────────────────
 
-    def _speak(self, text: str) -> None:
+    def _hablar(self, texto: str) -> None:
         """Convierte texto a voz si TTS está habilitado y disponible."""
         if os.getenv("NO_TTS", "false").lower() == "true":
             return
-        if self._voice_output is not None:
-            self._voice_output.speak(text)
+        if self._salida_voz is not None:
+            self._salida_voz.speak(texto)
 
     # ─── Bucle principal ──────────────────────────────────────────────────────
 
-    def run(self) -> None:
-        """Bucle principal de conversación."""
+    def ejecutar(self) -> None:
+        """Ejecuta el bucle principal de conversación con el usuario."""
         reset_all()
 
         while True:
             try:
-                user_input = self._get_user_input()
+                entrada_usuario: Optional[str] = self._obtener_entrada_usuario()
             except KeyboardInterrupt:
                 print("\n\n👋 ¡Hasta luego!")
-                self._speak("¡Hasta luego!")
+                self._hablar("¡Hasta luego!")
                 break
 
-            if user_input is None:
-                # Sin entrada (timeout de voz o error)
+            if entrada_usuario is None:
                 continue
 
-            stripped = user_input.strip().lower()
-            if not stripped:
+            texto_limpio: str = entrada_usuario.strip().lower()
+            if not texto_limpio:
                 continue
 
-            # Comando de salida
-            if stripped in EXIT_COMMANDS:
-                farewell = "¡Hasta luego! Ha sido un placer ayudarte."
-                print(f"\n🤖 AMADEUS: {farewell}")
-                self._speak(farewell)
+            if texto_limpio in COMANDOS_SALIDA:
+                despedida: str = "¡Hasta luego! Ha sido un placer ayudarte."
+                print(f"\n🤖 AMADEUS: {despedida}")
+                self._hablar(despedida)
                 break
 
-            print(f"\n👤 Tú: {user_input}")
+            print(f"\n👤 Tú: {entrada_usuario}")
 
-            # ¿Hay una acción pendiente de confirmación?
-            pending = get_pending_action()
-            if pending:
-                self._handle_confirmation(pending, stripped)
+            accion_pendiente: Optional[PendingAction] = get_pending_action()
+            if accion_pendiente:
+                self._manejar_confirmacion(accion_pendiente, texto_limpio)
             else:
-                if self._maybe_handle_direct_command(user_input):
+                if self._intentar_comando_directo(entrada_usuario):
                     continue
-                self._run_agent(user_input)
+                self._ejecutar_agente(entrada_usuario)
 
     # ─── Entrada de usuario ───────────────────────────────────────────────────
 
-    def _get_user_input(self) -> str | None:
-        """Obtiene entrada del usuario (voz o texto)."""
-        if self.voice_mode and self._voice_input:
-            text = self._voice_input.listen()
-            if text:
-                return text
-            # Fallback a texto si está habilitado
-            if self.text_fallback:
-                return self._get_text_input()
+    def _obtener_entrada_usuario(self) -> Optional[str]:
+        """Obtiene la entrada del usuario por micrófono o teclado."""
+        if self.modo_voz and self._entrada_voz:
+            texto: Optional[str] = self._entrada_voz.listen()
+            if texto:
+                return texto
+            if self.respaldo_texto:
+                return self._obtener_entrada_texto()
             return None
-        return self._get_text_input()
+        return self._obtener_entrada_texto()
 
-    def _get_text_input(self) -> str | None:
-        """Obtiene entrada de texto del usuario."""
+    def _obtener_entrada_texto(self) -> Optional[str]:
+        """Lee una línea de texto ingresada por el usuario en consola."""
         try:
             return input("\n💬 Tú: ").strip()
         except EOFError:
@@ -240,262 +348,307 @@ class AmadeusApp:
 
     # ─── Confirmación HITL ────────────────────────────────────────────────────
 
-    def _handle_confirmation(self, pending: PendingAction, user_input_lower: str) -> None:
-        """Maneja la respuesta del usuario ante una acción pendiente."""
-        if user_input_lower in CONFIRM_PHRASES:
-            confirm(pending.key)
-            confirmation_msg = "Entendido, procediendo con la acción..."
-            print(f"\n🤖 AMADEUS: {confirmation_msg}")
-            self._speak(confirmation_msg)
-            self._run_agent(
+    def _manejar_confirmacion(
+        self,
+        accion_pendiente: PendingAction,
+        entrada_minusculas: str,
+    ) -> None:
+        """Procesa la respuesta del usuario ante una acción pendiente de confirmación."""
+        if entrada_minusculas in FRASES_CONFIRMACION:
+            confirm(accion_pendiente.key)
+            mensaje_confirmacion: str = "Entendido, procediendo con la acción..."
+            print(f"\n🤖 AMADEUS: {mensaje_confirmacion}")
+            self._hablar(mensaje_confirmacion)
+            self._ejecutar_agente(
                 "El usuario ha confirmado la acción. "
                 "Por favor, procede exactamente con la misma llamada a la herramienta que hiciste antes."
             )
-        elif user_input_lower in CANCEL_PHRASES:
-            cancel(pending.key)
+        elif entrada_minusculas in FRASES_CANCELACION:
+            cancel(accion_pendiente.key)
             reset_all()
-            cancel_msg = "Acción cancelada. No se ha modificado ningún archivo."
-            print(f"\n🤖 AMADEUS: {cancel_msg}")
-            self._speak(cancel_msg)
+            mensaje_cancelacion: str = (
+                "Acción cancelada. No se ha modificado ningún archivo."
+            )
+            print(f"\n🤖 AMADEUS: {mensaje_cancelacion}")
+            self._hablar(mensaje_cancelacion)
         else:
-            # El usuario dijo otra cosa, recordarle que hay una confirmación pendiente
-            reminder = (
-                f"Tengo pendiente tu confirmación para: «{pending.description}». "
+            recordatorio: str = (
+                f"Tengo pendiente tu confirmación para: «{accion_pendiente.description}». "
                 f"Di 'confirmar' para continuar o 'cancelar' para abortar."
             )
-            print(f"\n🤖 AMADEUS: {reminder}")
-            self._speak(reminder)
+            print(f"\n🤖 AMADEUS: {recordatorio}")
+            self._hablar(recordatorio)
 
-    def _maybe_handle_direct_command(self, user_input: str) -> bool:
-        """Ejecuta comandos de apertura sin pasar por el modelo."""
-        normalized = re.sub(r"\s+", " ", user_input.strip().lower())
-        match = re.match(r"^(abre|abrir|open|launch|lanzar)\s+(.+)$", normalized)
-        if not match:
+    def _intentar_comando_directo(self, entrada_usuario: str) -> bool:
+        """Ejecuta comandos directos de apertura sin invocar al LLM."""
+        normalizado: str = re.sub(r"\s+", " ", entrada_usuario.strip().lower())
+        coincidencia = re.match(
+            r"^(abre|abrir|open|launch|lanzar)\s+(.+)$",
+            normalizado,
+        )
+        if not coincidencia:
             return False
 
-        target = match.group(2).strip()
-        target = re.sub(r"^(la|el|los|las|the|my|mi|mis)\s+", "", target)
+        objetivo: str = coincidencia.group(2).strip()
+        objetivo = re.sub(r"^(la|el|los|las|the|my|mi|mis)\s+", "", objetivo)
 
-        if target in WEB_APP_MAP:
-            result = open_url.invoke({"url": WEB_APP_MAP[target]})
-            self._announce_direct_action(target, result)
+        if objetivo in MAPA_APLICACIONES_WEB:
+            resultado: str = open_url.invoke(
+                {"url": MAPA_APLICACIONES_WEB[objetivo]}
+            )
+            self._anunciar_accion_directa(objetivo, resultado)
             return True
 
-        if target in SYSTEM_PANEL_KEYWORDS:
-            result = open_system_settings.invoke({"setting": target})
-            self._announce_direct_action(target, result)
+        if objetivo in PALABRAS_CLAVE_PANEL_SISTEMA:
+            resultado = open_system_settings.invoke({"setting": objetivo})
+            self._anunciar_accion_directa(objetivo, resultado)
             return True
 
-        if target in {"explorador", "explorer", "file explorer"}:
-            result = open_file_explorer.invoke({"path": ""})
-            self._announce_direct_action(target, result)
+        if objetivo in {"explorador", "explorer", "file explorer"}:
+            resultado = open_file_explorer.invoke({"path": ""})
+            self._anunciar_accion_directa(objetivo, resultado)
             return True
 
-        result = open_application.invoke({"app_name": target})
-        self._announce_direct_action(target, result)
+        resultado = open_application.invoke({"app_name": objetivo})
+        self._anunciar_accion_directa(objetivo, resultado)
         return True
 
-    def _announce_direct_action(self, target: str, result: str) -> None:
-        if result.startswith("✓") or result.startswith("Opened") or result.startswith("Abierto"):
-            message = f"He abierto {target}."
+    def _anunciar_accion_directa(self, objetivo: str, resultado: str) -> None:
+        """Muestra y pronuncia el resultado de una acción directa."""
+        if (
+            resultado.startswith("✓")
+            or resultado.startswith("Opened")
+            or resultado.startswith("Abierto")
+        ):
+            mensaje: str = f"He abierto {objetivo}."
         else:
-            message = f"No pude abrir {target}."
-        print(f"\n🤖 AMADEUS: {message}")
-        self._speak(message)
+            mensaje = f"No pude abrir {objetivo}."
+        print(f"\n🤖 AMADEUS: {mensaje}")
+        self._hablar(mensaje)
 
     # ─── Invocación del agente ────────────────────────────────────────────────
 
-    def _run_agent(self, user_message: str) -> None:
-        """Invoca el agente LangGraph y procesa la respuesta."""
-        config = {"configurable": {"thread_id": self.thread_id}}
-        input_payload = {
-            "messages": [{"role": "user", "content": user_message}]
+    def _ejecutar_agente(self, mensaje_usuario: str) -> None:
+        """Invoca el agente LangGraph en modo streaming y procesa la respuesta."""
+        configuracion: Dict[str, Any] = {
+            "configurable": {"thread_id": self.id_hilo}
+        }
+        carga_entrada: Dict[str, Any] = {
+            "messages": [{"role": "user", "content": mensaje_usuario}]
         }
 
-        full_response_parts: list[str] = []
-        current_tool: str | None = None
-        printed_header = False
+        partes_respuesta: List[str] = []
+        herramienta_actual: Optional[str] = None
+        encabezado_impreso: bool = False
 
         try:
-            for chunk in self.agent.stream(
-                input_payload,
-                config=config,
-                stream_mode="messages"
+            for fragmento in self.agente.stream(
+                carga_entrada,
+                config=configuracion,
+                stream_mode="messages",
             ):
-                message, metadata = chunk
-                node = metadata.get("langgraph_node", "")
+                mensaje, metadatos = fragmento
+                nodo: str = metadatos.get("langgraph_node", "")
 
                 # ── Indicador de herramienta en uso ──────────────────────
-                if node == "tools" and hasattr(message, "name") and message.name:
-                    if message.name != current_tool:
-                        current_tool = message.name
-                        if not printed_header:
+                if (
+                    nodo == "tools"
+                    and hasattr(mensaje, "name")
+                    and mensaje.name
+                ):
+                    if mensaje.name != herramienta_actual:
+                        herramienta_actual = mensaje.name
+                        if not encabezado_impreso:
                             print("\n🤖 AMADEUS: ", end="", flush=True)
-                            printed_header = True
-                        print(f"\n   🔧 [{current_tool}]", end="", flush=True)
+                            encabezado_impreso = True
+                        print(
+                            f"\n   🔧 [{herramienta_actual}]",
+                            end="",
+                            flush=True,
+                        )
 
                 # ── Tokens de texto del agente ────────────────────────────
-                # Capturar contenido de tipo string en mensajes AI,
-                # independientemente del nodo (algunos modelos emiten en "agent",
-                # otros en "__end__" o directamente como AIMessageChunk)
-                content = getattr(message, "content", None)
-                msg_type = getattr(message, "type", "")
+                contenido: Any = getattr(mensaje, "content", None)
+                tipo_mensaje: str = getattr(mensaje, "type", "")
 
-                if content and isinstance(content, str) and msg_type == "ai":
-                    if not printed_header:
+                if (
+                    contenido
+                    and isinstance(contenido, str)
+                    and tipo_mensaje in {"ai", "AIMessageChunk"}
+                ):
+                    if not encabezado_impreso:
                         print("\n🤖 AMADEUS: ", end="", flush=True)
-                        printed_header = True
-                    print(content, end="", flush=True)
-                    full_response_parts.append(content)
+                        encabezado_impreso = True
+                    print(contenido, end="", flush=True)
+                    partes_respuesta.append(contenido)
 
-                # ── Contenido en formato lista (tool_use + text mezclados) ─
-                elif content and isinstance(content, list) and msg_type == "ai":
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text_part = block.get("text", "")
-                            if text_part:
-                                if not printed_header:
+                elif (
+                    contenido
+                    and isinstance(contenido, list)
+                    and tipo_mensaje in {"ai", "AIMessageChunk"}
+                ):
+                    for bloque in contenido:
+                        if (
+                            isinstance(bloque, dict)
+                            and bloque.get("type") == "text"
+                        ):
+                            parte_texto: str = bloque.get("text", "")
+                            if parte_texto:
+                                if not encabezado_impreso:
                                     print("\n🤖 AMADEUS: ", end="", flush=True)
-                                    printed_header = True
-                                print(text_part, end="", flush=True)
-                                full_response_parts.append(text_part)
+                                    encabezado_impreso = True
+                                print(parte_texto, end="", flush=True)
+                                partes_respuesta.append(parte_texto)
 
         except KeyboardInterrupt:
             print("\n[Interrumpido]")
             return
         except Exception as exc:
-            error_msg = f"\n❌ Error del agente: {exc}"
-            print(error_msg)
-            self._speak("Ha ocurrido un error. Por favor, inténtalo de nuevo.")
+            mensaje_error: str = f"\n❌ Error del agente: {exc}"
+            print(mensaje_error)
+            self._hablar("Ha ocurrido un error. Por favor, inténtalo de nuevo.")
             return
 
-        # Si no se imprimió nada, obtener la respuesta final del estado del grafo
-        if not full_response_parts:
-            final_from_state = self._get_last_ai_message()
-            if final_from_state:
-                print(f"\n🤖 AMADEUS: {final_from_state}", flush=True)
-                full_response_parts.append(final_from_state)
+        if not partes_respuesta:
+            respuesta_estado: Optional[str] = self._obtener_ultimo_mensaje_ia()
+            if respuesta_estado:
+                print(f"\n🤖 AMADEUS: {respuesta_estado}", flush=True)
+                partes_respuesta.append(respuesta_estado)
 
-        if printed_header or full_response_parts:
-            print()  # Salto de línea final
+        if encabezado_impreso or partes_respuesta:
+            print()
 
-        final_response = "".join(full_response_parts)
+        respuesta_final: str = "".join(partes_respuesta)
 
-        # Verificar si el agente registró una acción pendiente de confirmación
-        pending = get_pending_action()
-        if pending:
-            confirmation_prompt = (
-                f"{final_response}\n\n"
-                f"⚠️  CONFIRMACIÓN REQUERIDA: {pending.description}\n"
+        accion_pendiente: Optional[PendingAction] = get_pending_action()
+        if accion_pendiente:
+            aviso_confirmacion: str = (
+                f"{respuesta_final}\n\n"
+                f"⚠️  CONFIRMACIÓN REQUERIDA: {accion_pendiente.description}\n"
                 f"   Di 'confirmar' para continuar o 'cancelar' para abortar."
             )
-            print(f"\r🤖 AMADEUS: {confirmation_prompt}")
-            self._speak(
-                f"{final_response}. {pending.description}. "
+            print(f"\r🤖 AMADEUS: {aviso_confirmacion}")
+            self._hablar(
+                f"{respuesta_final}. {accion_pendiente.description}. "
                 f"Di confirmar para continuar o cancelar para abortar."
             )
         else:
-            if final_response:
-                self._speak(final_response)
+            if respuesta_final:
+                self._hablar(respuesta_final)
             reset_all()
 
-    def _get_last_ai_message(self) -> str | None:
+    def _obtener_ultimo_mensaje_ia(self) -> Optional[str]:
         """
-        Obtiene el último mensaje AI del estado del grafo como fallback.
-        Útil cuando el stream no emite tokens de texto (modelos pequeños).
+        Obtiene el último mensaje AI del estado del grafo como mecanismo de respaldo.
+
+        Returns:
+            Optional[str]: Texto del último mensaje generado por el modelo, o None.
         """
         try:
-            config = {"configurable": {"thread_id": self.thread_id}}
-            state = self.agent.get_state(config)
-            messages = state.values.get("messages", [])
-            # Recorrer al revés buscando el último AIMessage con contenido
-            for msg in reversed(messages):
-                msg_type = getattr(msg, "type", "")
-                content  = getattr(msg, "content", "")
-                if msg_type == "ai" and isinstance(content, str) and content.strip():
-                    return content.strip()
-                if msg_type == "ai" and isinstance(content, list):
-                    # Extraer bloques de texto
-                    texts = [
-                        b.get("text", "") for b in content
+            configuracion: Dict[str, Any] = {
+                "configurable": {"thread_id": self.id_hilo}
+            }
+            estado = self.agente.get_state(configuracion)
+            mensajes: List[Any] = estado.values.get("messages", [])
+            for msg in reversed(mensajes):
+                tipo_msg: str = getattr(msg, "type", "")
+                contenido: Any = getattr(msg, "content", "")
+                if (
+                    tipo_msg == "ai"
+                    and isinstance(contenido, str)
+                    and contenido.strip()
+                ):
+                    return contenido.strip()
+                if tipo_msg == "ai" and isinstance(contenido, list):
+                    textos: List[str] = [
+                        b.get("text", "")
+                        for b in contenido
                         if isinstance(b, dict) and b.get("type") == "text"
                     ]
-                    joined = " ".join(t for t in texts if t).strip()
-                    if joined:
-                        return joined
+                    unido: str = " ".join(t for t in textos if t).strip()
+                    if unido:
+                        return unido
         except Exception:
             pass
         return None
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="AMADEUS — Asistente de IA Local"
+
+# Alias de compatibilidad
+AmadeusApp = AplicacionAmadeus
+
+
+def analizar_argumentos() -> argparse.Namespace:
+    """Analiza y retorna los argumentos de línea de comandos."""
+    analizador = argparse.ArgumentParser(
+        description="AMADEUS — Asistente de IA (Local Ollama / Google Gemini)"
     )
-    parser.add_argument(
-        "--voice", "-v",
+    analizador.add_argument(
+        "--voice",
+        "-v",
         action="store_true",
-        help="Activar modo de entrada por voz (micrófono)"
+        help="Activar modo de entrada por voz (micrófono)",
     )
-    parser.add_argument(
-        "--text-fallback", "-t",
+    analizador.add_argument(
+        "--text-fallback",
+        "-t",
         action="store_true",
-        help="Si la voz falla, usar teclado como fallback"
+        help="Si la voz falla, usar teclado como respaldo",
     )
-    parser.add_argument(
+    analizador.add_argument(
         "--no-tts",
         action="store_true",
-        help="Desactivar síntesis de voz (solo texto en pantalla)"
+        help="Desactivar síntesis de voz (solo texto en pantalla)",
     )
-    parser.add_argument(
-        "--mic", "-m",
+    analizador.add_argument(
+        "--mic",
+        "-m",
         type=int,
         default=None,
         metavar="INDEX",
-        help="Índice del micrófono a usar (evita el menú de selección). "
+        help=(
+            "Índice del micrófono a usar (evita el menú de selección). "
             "Usa --list-mics para ver los índices disponibles."
+        ),
     )
-    parser.add_argument(
+    analizador.add_argument(
         "--list-mics",
         action="store_true",
-        help="Listar todos los micrófonos disponibles y salir"
+        help="Listar todos los micrófonos disponibles y salir",
     )
-    return parser.parse_args()
+    return analizador.parse_args()
 
 
 def main() -> None:
-    args = parse_args()
+    """Punto de entrada principal de la aplicación CLI."""
+    argumentos = analizar_argumentos()
 
-    # Listar micrófonos y salir
-    if args.list_mics:
+    if argumentos.list_mics:
         from voice.input import list_microphones
-        mics = list_microphones()
+
+        microfonos = list_microphones()
         print("\n🎙️  Micrófonos disponibles:")
         print("─" * 50)
-        for idx, name in mics:
-            print(f"  [{idx:2d}] {name}")
+        for indice, nombre in microfonos:
+            print(f"  [{indice:2d}] {nombre}")
         print("─" * 50)
         print("\nUsa:  python main.py --voice --mic <INDEX>")
         return
 
-    # Pre-seleccionar micrófono si se pasó --mic
-    if args.mic is not None:
-        os.environ["MICROPHONE_INDEX"] = str(args.mic)
+    if argumentos.mic is not None:
+        os.environ["MICROPHONE_INDEX"] = str(argumentos.mic)
 
-    voice_mode = args.voice
-    text_fallback = args.text_fallback
-
-    if args.no_tts:
+    if argumentos.no_tts:
         os.environ["NO_TTS"] = "true"
 
-    app = AmadeusApp(
-        voice_mode=voice_mode,
-        text_fallback=text_fallback,
+    aplicacion = AplicacionAmadeus(
+        modo_voz=argumentos.voice,
+        respaldo_texto=argumentos.text_fallback,
     )
 
-    if not app.setup():
+    if not aplicacion.inicializar():
         sys.exit(1)
 
-    app.run()
+    aplicacion.ejecutar()
 
 
 if __name__ == "__main__":

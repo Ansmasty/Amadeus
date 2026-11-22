@@ -1,36 +1,52 @@
 """
 agent/tools/browser.py
 
-Browser automation tools for AMADEUS.
-Uses only the stdlib webbrowser module - no external dependencies.
-The agent cannot open arbitrary shell commands; only controlled URL navigation.
+Herramientas de automatización de navegador y búsqueda web para AMADEUS.
+Utiliza el módulo estándar `webbrowser` y `httpx` para consultas controladas.
 """
 import re
 import webbrowser
+from typing import Dict, List, Tuple
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import httpx
 from langchain_core.tools import tool
 
 
+def _limpiar_etiquetas_html(texto: str) -> str:
+    """Elimina etiquetas HTML y normaliza espacios en blanco de un fragmento."""
+    texto_sin_html: str = re.sub(r"<.*?>", "", texto)
+    texto_sin_html = texto_sin_html.replace("&quot;", '"').replace("&#39;", "'")
+    texto_sin_html = re.sub(r"\s+", " ", texto_sin_html)
+    return texto_sin_html.strip()
+
+
 @tool
 def open_url(url: str) -> str:
     """
-    Open a URL in the system's default web browser.
-    Accepts http:// or https:// URLs. If no scheme is provided, https:// is assumed.
-    Use this to navigate to any website.
+    Abre una dirección URL en el navegador web predeterminado del sistema operativo.
+
+    Acepta URLs con esquema `http://` o `https://`. Si no se proporciona esquema,
+    se asume automáticamente `https://`. Úsala para navegar a cualquier sitio web.
+
+    Args:
+        url (str): Dirección URL completa o dominio del sitio web a abrir
+            (por ejemplo, "https://www.google.com" o "github.com").
+
+    Returns:
+        str: Mensaje indicando si la URL se abrió correctamente o el detalle del error.
     """
-    url = url.strip()
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
+    url_limpia: str = url.strip()
+    if not url_limpia.startswith(("http://", "https://")):
+        url_limpia = "https://" + url_limpia
 
     try:
-        opened = webbrowser.open(url)
-        if opened:
-            return f"Opened in browser: {url}"
+        abierto: bool = webbrowser.open(url_limpia)
+        if abierto:
+            return f"Opened in browser: {url_limpia}"
         return (
-            f"Could not open browser (no default browser configured on this system). "
-            f"URL was: {url}"
+            "Could not open browser (no default browser configured on this system). "
+            f"URL was: {url_limpia}"
         )
     except Exception as exc:
         return f"Error opening browser: {exc}"
@@ -39,65 +55,97 @@ def open_url(url: str) -> str:
 @tool
 def search_youtube(query: str) -> str:
     """
-    Search YouTube for videos matching the given query.
-    Opens the YouTube search results page in the default browser.
-    Example: search_youtube("jazz piano tutorial")
+    Busca videos en YouTube que coincidan con la consulta dada y abre los resultados.
+
+    Construye la URL de búsqueda de YouTube y abre la página de resultados en el
+    navegador web predeterminado del sistema.
+
+    Args:
+        query (str): Términos de búsqueda para encontrar videos en YouTube
+            (por ejemplo, "tutorial de python langchain").
+
+    Returns:
+        str: Confirmación de apertura de la búsqueda en el navegador o mensaje de error.
     """
-    if not query.strip():
+    consulta_limpia: str = query.strip()
+    if not consulta_limpia:
         return "Error: Search query cannot be empty."
 
-    encoded = quote_plus(query.strip())
-    url = f"https://www.youtube.com/results?search_query={encoded}"
-    return open_url.invoke({"url": url})
+    consulta_codificada: str = quote_plus(consulta_limpia)
+    url_busqueda: str = (
+        f"https://www.youtube.com/results?search_query={consulta_codificada}"
+    )
+    return str(open_url.invoke({"url": url_busqueda}))
 
 
 @tool
 def search_web(query: str) -> str:
     """
-    Search the web for news, current events, research, and general factual queries.
-    Returns a compact summary of top results from DuckDuckGo HTML.
-    Use this when the user asks about current events, investigations, or topics that require external sources.
+    Realiza una búsqueda en la web sobre noticias, actualidad, investigación o datos generales.
+
+    Consulta DuckDuckGo HTML y devuelve un resumen estructurado con los primeros
+    resultados (título, enlace limpio y fragmento descriptivo). Úsala cuando el usuario
+    pregunte sobre eventos recientes o temas que requieran fuentes externas en internet.
+
+    Args:
+        query (str): Consulta o términos de búsqueda a investigar en la web.
+
+    Returns:
+        str: Lista formateada con los principales resultados web o mensaje de error.
     """
-    q = query.strip()
-    if not q:
+    consulta: str = query.strip()
+    if not consulta:
         return "Error: Search query cannot be empty."
 
-    url = "https://html.duckduckgo.com/html/"
+    url_buscador: str = "https://html.duckduckgo.com/html/"
     try:
-        response = httpx.get(
-            url,
-            params={"q": q},
+        respuesta = httpx.get(
+            url_buscador,
+            params={"q": consulta},
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=10.0,
             follow_redirects=True,
         )
-        response.raise_for_status()
+        respuesta.raise_for_status()
     except Exception as exc:
         return f"Error searching the web: {exc}"
 
-    html = response.text
-    result_blocks = re.findall(r'<a rel="nofollow" class="result__a" href="([^"]+)"[^>]*>(.*?)</a>', html, re.S)
-    snippets = re.findall(r'<a class="result__snippet"[^>]*>(.*?)</a>', html, re.S)
+    contenido_html: str = respuesta.text
+    bloques_resultado: List[Tuple[str, str]] = re.findall(
+        r'<a rel="nofollow" class="result__a" href="([^"]+)"[^>]*>(.*?)</a>',
+        contenido_html,
+        re.S,
+    )
+    fragmentos: List[str] = re.findall(
+        r'<a class="result__snippet"[^>]*>(.*?)</a>',
+        contenido_html,
+        re.S,
+    )
 
-    if not result_blocks:
-        return f"No se encontraron resultados para: {q}"
+    if not bloques_resultado:
+        return f"No se encontraron resultados para: {consulta}"
 
-    def _strip_tags(text: str) -> str:
-        text = re.sub(r"<.*?>", "", text)
-        text = text.replace("&quot;", '"').replace("&#39;", "'")
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()
+    lineas_salida: List[str] = [f"Resultados web para: {consulta}"]
+    for indice, (enlace_crudo, titulo_html) in enumerate(
+        bloques_resultado[:5],
+        start=1,
+    ):
+        titulo: str = _limpiar_etiquetas_html(titulo_html)
+        enlace_analizado = urlparse(enlace_crudo)
+        parametros_consulta: Dict[str, List[str]] = parse_qs(
+            enlace_analizado.query
+        )
+        enlace_limpio: str = unquote(
+            parametros_consulta.get("uddg", [enlace_crudo])[0]
+        )
+        resumen: str = (
+            _limpiar_etiquetas_html(fragmentos[indice - 1])
+            if indice - 1 < len(fragmentos)
+            else ""
+        )
+        lineas_salida.append(f"{indice}. {titulo}")
+        lineas_salida.append(f"   {enlace_limpio}")
+        if resumen:
+            lineas_salida.append(f"   {resumen}")
 
-    lines = [f"Resultados web para: {q}"]
-    for idx, (href, title_html) in enumerate(result_blocks[:5], start=1):
-        title = _strip_tags(title_html)
-        parsed_href = urlparse(href)
-        query_params = parse_qs(parsed_href.query)
-        clean_href = unquote(query_params.get("uddg", [href])[0])
-        snippet = _strip_tags(snippets[idx - 1]) if idx - 1 < len(snippets) else ""
-        lines.append(f"{idx}. {title}")
-        lines.append(f"   {clean_href}")
-        if snippet:
-            lines.append(f"   {snippet}")
-
-    return "\n".join(lines)
+    return "\n".join(lineas_salida)

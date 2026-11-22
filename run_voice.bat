@@ -7,7 +7,7 @@ if exist .venv310\Scripts\activate.bat (
 
 where py >nul 2>&1
 if %errorlevel%==0 (
-	py -3.10 -X utf8 main.py --voice
+	py -3.13 -X utf8 main.py --voice
 ) else (
 	python -X utf8 main.py --voice
 )

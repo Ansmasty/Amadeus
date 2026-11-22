@@ -1,23 +1,19 @@
 """
 agent/core.py
 
-LangGraph ReAct agent factory for AMADEUS.
-
-Key design decisions:
-- ChatOllama with llama3.1:8b (tool-calling capable model)
-- create_react_agent from langgraph.prebuilt (not langchain.agents)
-- MemorySaver checkpointer for per-thread conversation persistence
-- temperature=0.1 for reliable tool call JSON generation
-- System prompt explicitly handles the CONFIRMATION_SENTINEL flow
+Fábrica del agente ReAct con LangGraph para AMADEUS.
+Soporta inyección de modelos LLM tanto locales (Ollama) como en la nube (Gemini).
 """
 import os
+from typing import Any, List, Optional, Tuple, Union
 
 from dotenv import load_dotenv
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import SystemMessage
-from langchain_ollama import ChatOllama
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import create_react_agent
 
+from agent.llm_factory import PROVEEDOR_LOCAL, crear_modelo_llm
 from agent.tools import ALL_TOOLS
 
 load_dotenv()
@@ -164,72 +160,116 @@ Responde siempre en el idioma que use el usuario.
 Si habla en español, responde en español. Si en inglés, en inglés.
 """
 
-# ─── Agent Factory ────────────────────────────────────────────────────────────
+
+# ─── Funciones del Núcleo ─────────────────────────────────────────────────────
 
 
-def check_ollama_connection(base_url: str, model: str) -> tuple[bool, str]:
+def verificar_conexion_ollama(url_base: str, modelo: str) -> Tuple[bool, str]:
     """
-    Verify that Ollama is running and the requested model is available.
-    Returns (is_ok, message).
+    Verifica que el servidor local de Ollama esté activo y que el modelo exista.
+
+    Args:
+        url_base (str): URL base donde escucha el servidor de Ollama.
+        modelo (str): Nombre del modelo de Ollama requerido.
+
+    Returns:
+        Tuple[bool, str]: Tupla con (estado_conexion, mensaje_detalle).
     """
     try:
         import httpx
-        response = httpx.get(f"{base_url}/api/tags", timeout=3.0)
-        response.raise_for_status()
-        data = response.json()
-        available_models = [m["name"] for m in data.get("models", [])]
-        model_found = any(model in m or m in model for m in available_models)
-        if not model_found:
-            model_list = "\n  ".join(available_models) if available_models else "(none)"
+
+        respuesta = httpx.get(f"{url_base}/api/tags", timeout=3.0)
+        respuesta.raise_for_status()
+        datos: dict[str, Any] = respuesta.json()
+        modelos_disponibles: List[str] = [
+            m["name"] for m in datos.get("models", [])
+        ]
+        modelo_encontrado: bool = any(
+            modelo in m or m in modelo for m in modelos_disponibles
+        )
+        if not modelo_encontrado:
+            lista_modelos: str = (
+                "\n  ".join(modelos_disponibles)
+                if modelos_disponibles
+                else "(ninguno)"
+            )
             return False, (
-                f"Model '{model}' not found in Ollama.\n"
-                f"Available models:\n  {model_list}\n\n"
-                f"Run: ollama pull {model}"
+                f"El modelo '{modelo}' no se encontró en Ollama.\n"
+                f"Modelos disponibles:\n  {lista_modelos}\n\n"
+                f"Ejecuta: ollama pull {modelo}"
             )
         return True, "OK"
     except ImportError:
-        return True, "OK (httpx not installed, skipping pre-check)"
+        return True, "OK (httpx no instalado, omitiendo verificación previa)"
     except Exception as exc:
         return False, (
-            f"Cannot connect to Ollama at {base_url}.\n"
+            f"No se puede conectar con Ollama en {url_base}.\n"
             f"Error: {exc}\n\n"
-            f"Make sure Ollama is running:\n"
+            f"Asegúrate de que Ollama esté en ejecución:\n"
             f"  Windows: ollama serve\n"
-            f"  Or start the Ollama desktop app"
+            f"  O inicia la aplicación de escritorio de Ollama"
         )
 
 
-def create_agent():
+def crear_agente(
+    modelo_llm: Optional[Union[BaseChatModel, str]] = None,
+    proveedor: str = PROVEEDOR_LOCAL,
+) -> Tuple[Any, str, str]:
     """
-    Build and return the LangGraph ReAct agent with MemorySaver checkpointing.
+    Construye y retorna el agente ReAct de LangGraph con persistencia en memoria.
 
-    The returned agent is a CompiledGraph. Invoke it with:
-        agent.stream(
-            {"messages": [{"role": "user", "content": "..."}]},
-            config={"configurable": {"thread_id": "some-uuid"}},
-            stream_mode="messages",
+    Permite inyectar una instancia de `BaseChatModel` ya creada o bien indicar
+    el nombre del proveedor ("local" o "gemini") para delegar su creación a la
+    fábrica `crear_modelo_llm`.
+
+    Args:
+        modelo_llm (Optional[Union[BaseChatModel, str]]): Instancia del modelo
+            LLM inyectado, o nombre del proveedor si se pasa como cadena.
+        proveedor (str): Proveedor a utilizar cuando `modelo_llm` es None.
+            Por defecto "local".
+
+    Returns:
+        Tuple[Any, str, str]: Tupla con (grafo_agente_compilado, origen_o_url, nombre_modelo).
+    """
+    proveedor_efectivo: str = proveedor
+    instancia_llm: BaseChatModel
+
+    if isinstance(modelo_llm, BaseChatModel):
+        instancia_llm = modelo_llm
+    elif isinstance(modelo_llm, str):
+        proveedor_efectivo = modelo_llm.strip().lower()
+        instancia_llm = crear_modelo_llm(proveedor_efectivo)
+    else:
+        proveedor_efectivo = proveedor.strip().lower()
+        instancia_llm = crear_modelo_llm(proveedor_efectivo)
+
+    nombre_modelo: str = str(
+        getattr(instancia_llm, "model", None)
+        or getattr(instancia_llm, "model_name", None)
+        or (
+            os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+            if proveedor_efectivo == "gemini"
+            else os.getenv("OLLAMA_MODEL", "llama3.2:3b")
         )
-
-    Using a consistent thread_id preserves conversation history across
-    Streamlit reruns, which is critical for the HITL confirmation flow.
-    """
-    base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-    model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")   # ← cambiado
-
-    llm = ChatOllama(
-        model=model,
-        base_url=base_url,
-        temperature=0.1,       # Low temperature for deterministic tool call generation
-        num_predict=4096,      # Max tokens per LLM response
+    )
+    origen_endpoint: str = (
+        "Google Gemini API"
+        if proveedor_efectivo == "gemini"
+        else os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
     )
 
-    checkpointer = MemorySaver()
+    almacen_memoria = MemorySaver()
 
-    agent = create_react_agent(
-        model=llm,
+    agente = create_react_agent(
+        model=instancia_llm,
         tools=ALL_TOOLS,
         prompt=SystemMessage(content=SYSTEM_PROMPT),
-        checkpointer=checkpointer,
+        checkpointer=almacen_memoria,
     )
 
-    return agent, base_url, model
+    return agente, origen_endpoint, nombre_modelo
+
+
+# Alias de compatibilidad hacia atrás con módulos externos (ej. gui.py)
+check_ollama_connection = verificar_conexion_ollama
+create_agent = crear_agente

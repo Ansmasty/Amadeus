@@ -1,13 +1,15 @@
 """
 agent/tools/filesystem.py
 
-Filesystem tools for AMADEUS.
-All tools validate paths through security.validators before any I/O.
-Destructive operations (delete, move, overwrite) use the HITL confirmation
-registry and return CONFIRMATION_SENTINEL until the user approves.
+Herramientas de sistema de archivos para AMADEUS.
+Todas las herramientas validan las rutas mediante `security.validators` antes de
+realizar operaciones de entrada/salida. Las operaciones destructivas (eliminar,
+mover, sobrescribir, editar) utilizan el registro de confirmación HITL y devuelven
+`CONFIRMATION_SENTINEL` hasta que el usuario apruebe la operación.
 """
 import shutil
 from pathlib import Path
+from typing import List
 
 from langchain_core.tools import tool
 
@@ -16,119 +18,160 @@ from agent.hitl import (
     is_confirmed,
     register_pending,
 )
-from security.validators import validate_path, PathSecurityError
+from security.validators import (
+    PathSecurityError,
+    get_max_file_size_bytes,
+    validate_path,
+)
 
 
-# ─── Read-Only Tools ──────────────────────────────────────────────────────────
+# ─── Herramientas de Solo Lectura ─────────────────────────────────────────────
 
 
 @tool
 def list_directory(path: str) -> str:
     """
-    List the contents of a directory, showing file names, types, and sizes.
-    Use this to explore what files and folders exist at a given path.
-    Example: list_directory("C:/Users/me/Documents")
+    Lista el contenido de un directorio mostrando nombres, tipos (archivo o carpeta) y tamaños.
+
+    Úsala para explorar qué archivos y subcarpetas existen dentro de una ruta permitida.
+
+    Args:
+        path (str): Ruta del directorio que se desea explorar
+            (por ejemplo, "C:/Users/Usuario/Documents").
+
+    Returns:
+        str: Listado detallado de los elementos del directorio o mensaje de error.
     """
     try:
-        validated = validate_path(path)
+        ruta_validada: Path = validate_path(path)
     except PathSecurityError as exc:
         return f"Security error: {exc}"
 
-    if not validated.exists():
-        return f"Error: Path does not exist: {validated}"
-    if not validated.is_dir():
-        return f"Error: '{validated}' is a file, not a directory. Use read_file to read it."
+    if not ruta_validada.exists():
+        return f"Error: Path does not exist: {ruta_validada}"
+    if not ruta_validada.is_dir():
+        return (
+            f"Error: '{ruta_validada}' is a file, not a directory. "
+            "Use read_file to read it."
+        )
 
     try:
-        entries = sorted(validated.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+        entradas: List[Path] = sorted(
+            ruta_validada.iterdir(),
+            key=lambda p: (p.is_file(), p.name.lower()),
+        )
     except PermissionError:
-        return f"Error: Permission denied reading directory: {validated}"
+        return f"Error: Permission denied reading directory: {ruta_validada}"
 
-    if not entries:
-        return f"Directory is empty: {validated}"
+    if not entradas:
+        return f"Directory is empty: {ruta_validada}"
 
-    lines = [f"Contents of '{validated}' ({len(entries)} items):"]
-    for item in entries:
-        kind = "FILE" if item.is_file() else "DIR "
-        size_str = ""
-        if item.is_file():
+    lineas: List[str] = [
+        f"Contents of '{ruta_validada}' ({len(entradas)} items):"
+    ]
+    for elemento in entradas:
+        tipo_elemento: str = "FILE" if elemento.is_file() else "DIR "
+        texto_tamano: str = ""
+        if elemento.is_file():
             try:
-                size_str = f"  ({item.stat().st_size:,} bytes)"
+                texto_tamano = f"  ({elemento.stat().st_size:,} bytes)"
             except OSError:
-                size_str = "  (size unknown)"
-        lines.append(f"  [{kind}] {item.name}{size_str}")
+                texto_tamano = "  (size unknown)"
+        lineas.append(f"  [{tipo_elemento}] {elemento.name}{texto_tamano}")
 
-    return "\n".join(lines)
+    return "\n".join(lineas)
 
 
 @tool
 def read_file(path: str) -> str:
     """
-    Read and return the text content of a file.
-    Only works on plain text files (e.g., .txt, .py, .json, .md, .csv, .log).
-    For Excel files, use read_excel instead.
-    Respects a maximum file size limit configured in the environment.
-    Example: read_file("C:/Users/me/notes.txt")
-    """
-    from security.validators import get_max_file_size_bytes
+    Lee y devuelve el contenido de texto de un archivo.
 
+    Funciona con archivos de texto plano (como .txt, .py, .json, .md, .csv, .log).
+    Para hojas de cálculo Excel, utiliza `read_excel`. Respeta el límite máximo
+    de tamaño configurado en el entorno y trunca salidas mayores a 500 líneas.
+
+    Args:
+        path (str): Ruta completa del archivo de texto a leer
+            (por ejemplo, "C:/Users/Usuario/Desktop/notas.txt").
+
+    Returns:
+        str: Contenido del archivo con encabezado informativo o mensaje de error.
+    """
     try:
-        validated = validate_path(path)
+        ruta_validada: Path = validate_path(path)
     except PathSecurityError as exc:
         return f"Security error: {exc}"
 
-    if not validated.exists():
-        return f"Error: File does not exist: {validated}"
-    if not validated.is_file():
-        return f"Error: '{validated}' is a directory. Use list_directory to explore it."
+    if not ruta_validada.exists():
+        return f"Error: File does not exist: {ruta_validada}"
+    if not ruta_validada.is_file():
+        return (
+            f"Error: '{ruta_validada}' is a directory. "
+            "Use list_directory to explore it."
+        )
 
-    max_bytes = get_max_file_size_bytes()
+    maximo_bytes: int = get_max_file_size_bytes()
     try:
-        size = validated.stat().st_size
+        tamano_bytes: int = ruta_validada.stat().st_size
     except OSError as exc:
         return f"Error accessing file: {exc}"
 
-    if size > max_bytes:
+    if tamano_bytes > maximo_bytes:
         return (
-            f"Error: File is too large to read directly ({size:,} bytes). "
-            f"Maximum allowed: {max_bytes:,} bytes ({max_bytes // (1024*1024)} MB). "
-            f"Consider using a data analysis tool if this is a CSV/Excel file."
+            f"Error: File is too large to read directly ({tamano_bytes:,} bytes). "
+            f"Maximum allowed: {maximo_bytes:,} bytes ({maximo_bytes // (1024 * 1024)} MB). "
+            "Consider using a data analysis tool if this is a CSV/Excel file."
         )
 
     try:
-        content = validated.read_text(encoding="utf-8", errors="replace")
-        lines = content.splitlines()
-        line_count = len(lines)
-        truncated = ""
-        # Truncate very long outputs to avoid overwhelming the LLM context
-        if line_count > 500:
-            content = "\n".join(lines[:500])
-            truncated = f"\n\n[Output truncated: showing first 500 of {line_count} lines]"
-        return f"=== {validated.name} ({size:,} bytes, {line_count} lines) ===\n{content}{truncated}"
+        contenido: str = ruta_validada.read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+        lineas: List[str] = contenido.splitlines()
+        total_lineas: int = len(lineas)
+        aviso_truncado: str = ""
+        if total_lineas > 500:
+            contenido = "\n".join(lineas[:500])
+            aviso_truncado = (
+                f"\n\n[Output truncated: showing first 500 of {total_lineas} lines]"
+            )
+        return (
+            f"=== {ruta_validada.name} ({tamano_bytes:,} bytes, {total_lineas} lines) ===\n"
+            f"{contenido}{aviso_truncado}"
+        )
     except Exception as exc:
         return f"Error reading file: {exc}"
 
 
-# ─── Mutating Tools (no HITL needed) ─────────────────────────────────────────
+# ─── Herramientas de Creación y Modificación ─────────────────────────────────
 
 
 @tool
 def create_directory(path: str) -> str:
     """
-    Create a new directory (and any missing parent directories) at the given path.
-    Safe to call if the directory already exists.
-    Example: create_directory("C:/Users/me/Documents/new_project")
+    Crea un nuevo directorio (incluyendo carpetas padre faltantes) en la ruta indicada.
+
+    Es seguro llamarla aunque el directorio ya exista. No requiere confirmación HITL.
+
+    Args:
+        path (str): Ruta completa del directorio a crear
+            (por ejemplo, "C:/Users/Usuario/Documents/nuevo_proyecto").
+
+    Returns:
+        str: Confirmación de creación del directorio o mensaje de error.
     """
     try:
-        validated = validate_path(path)
+        ruta_validada: Path = validate_path(path)
     except PathSecurityError as exc:
         return f"Security error: {exc}"
 
     try:
-        validated.mkdir(parents=True, exist_ok=True)
-        return f"Directory created (or already exists): {validated}"
+        ruta_validada.mkdir(parents=True, exist_ok=True)
+        return f"Directory created (or already exists): {ruta_validada}"
     except PermissionError:
-        return f"Error: Permission denied creating directory: {validated}"
+        return f"Error: Permission denied creating directory: {ruta_validada}"
     except Exception as exc:
         return f"Error creating directory: {exc}"
 
@@ -136,51 +179,65 @@ def create_directory(path: str) -> str:
 @tool
 def write_file(path: str, content: str) -> str:
     """
-    Create a new file with the given content, or overwrite an existing one.
-    Use this for full rewrites (e.g., generating a new script) or when the
-    user explicitly wants to replace an entire file's contents.
-    For small, targeted changes to an existing file, prefer `edit_file`
-    instead — it's safer because it only touches the specific part that changed.
-    WARNING: overwriting an EXISTING file is DESTRUCTIVE and requires user
-    confirmation. Creating a brand-new file does not.
-    Example: write_file("C:/Proyectos/mi-app/utils.py", "def suma(a, b):\\n    return a + b\\n")
+    Crea un archivo nuevo con el contenido dado o sobrescribe uno existente.
+
+    Úsala para crear archivos desde cero o cuando el usuario pida explícitamente
+    reemplazar todo el contenido de un archivo. Para cambios puntuales en archivos
+    existentes, prefiere siempre `edit_file`. Sobrescribir un archivo existente
+    es una operación destructiva y requiere confirmación del usuario.
+
+    Args:
+        path (str): Ruta completa del archivo donde se escribirá el contenido.
+        content (str): Contenido completo de texto que se guardará en el archivo.
+
+    Returns:
+        str: Confirmación de escritura, sentinel de confirmación HITL o mensaje de error.
     """
     try:
-        validated = validate_path(path)
+        ruta_validada: Path = validate_path(path)
     except PathSecurityError as exc:
         return f"Security error: {exc}"
 
-    if validated.is_dir():
-        return f"Error: '{validated}' is a directory, not a file."
+    if ruta_validada.is_dir():
+        return f"Error: '{ruta_validada}' is a directory, not a file."
 
-    file_exists = validated.exists()
+    archivo_existe: bool = ruta_validada.exists()
 
-    if file_exists:
-        action_key = f"write:{validated}:{hash(content)}"
-        if not is_confirmed(action_key):
+    if archivo_existe:
+        clave_accion: str = f"write:{ruta_validada}:{hash(content)}"
+        if not is_confirmed(clave_accion):
             try:
-                preview = validated.read_text(encoding="utf-8", errors="replace")
+                vista_previa: str = ruta_validada.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                )
             except Exception:
-                preview = "(no se pudo leer el contenido actual)"
+                vista_previa = "(no se pudo leer el contenido actual)"
             register_pending(
-                key=action_key,
+                key=clave_accion,
                 description=(
-                    f"Sobrescribir el archivo '{validated.name}' "
-                    f"({len(preview.splitlines())} líneas actuales → "
+                    f"Sobrescribir el archivo '{ruta_validada.name}' "
+                    f"({len(vista_previa.splitlines())} líneas actuales → "
                     f"{len(content.splitlines())} líneas nuevas)?"
                 ),
                 action_type="write_file",
-                params={"path": str(validated), "content_preview": content[:500]},
+                params={
+                    "path": str(ruta_validada),
+                    "content_preview": content[:500],
+                },
             )
             return CONFIRMATION_SENTINEL
 
     try:
-        validated.parent.mkdir(parents=True, exist_ok=True)
-        validated.write_text(content, encoding="utf-8")
-        verb = "sobrescrito" if file_exists else "creado"
-        return f"Archivo {verb} correctamente: {validated} ({len(content.splitlines())} líneas)"
+        ruta_validada.parent.mkdir(parents=True, exist_ok=True)
+        ruta_validada.write_text(content, encoding="utf-8")
+        accion_verbo: str = "sobrescrito" if archivo_existe else "creado"
+        return (
+            f"Archivo {accion_verbo} correctamente: {ruta_validada} "
+            f"({len(content.splitlines())} líneas)"
+        )
     except PermissionError:
-        return f"Error: Permission denied writing to: {validated}"
+        return f"Error: Permission denied writing to: {ruta_validada}"
     except Exception as exc:
         return f"Error writing file: {exc}"
 
@@ -188,154 +245,195 @@ def write_file(path: str, content: str) -> str:
 @tool
 def edit_file(path: str, find: str, replace: str, count: int = 1) -> str:
     """
-    Make a targeted edit to an existing file: replaces an exact snippet of
-    text ('find') with new text ('replace'), leaving the rest of the file
-    untouched. Prefer this over `write_file` for small changes (fixing a
-    bug, renaming a variable, adding a parameter) since it's safer and lets
-    the user review exactly what changes.
-    'find' must match the file's content EXACTLY (including whitespace/indentation) —
-    read the file first with `read_file` to copy the exact snippet.
-    'count' limits how many occurrences to replace (default 1, use -1 for all).
-    WARNING: this is a DESTRUCTIVE operation and requires user confirmation.
-    Example: edit_file("C:/Proyectos/mi-app/main.py", "def old_name():", "def new_name():")
+    Realiza una edición puntual en un archivo existente reemplazando un fragmento exacto.
+
+    Busca el texto `find` (debe coincidir exactamente, incluyendo espacios e indentación)
+    y lo sustituye por `replace`. Lee primero el archivo con `read_file` para asegurarte
+    de copiar el fragmento exacto. Requiere confirmación del usuario antes de aplicar cambios.
+
+    Args:
+        path (str): Ruta completa del archivo existente que se desea editar.
+        find (str): Fragmento de texto exacto que se buscará en el archivo.
+        replace (str): Nuevo texto que reemplazará al fragmento buscado.
+        count (int): Número máximo de ocurrencias a reemplazar (por defecto 1;
+            usa -1 para reemplazar todas las apariciones).
+
+    Returns:
+        str: Confirmación de edición, sentinel de confirmación HITL o mensaje de error.
     """
     try:
-        validated = validate_path(path)
+        ruta_validada: Path = validate_path(path)
     except PathSecurityError as exc:
         return f"Security error: {exc}"
 
-    if not validated.exists() or not validated.is_file():
-        return f"Error: File does not exist: {validated}"
+    if not ruta_validada.exists() or not ruta_validada.is_file():
+        return f"Error: File does not exist: {ruta_validada}"
 
-    from security.validators import get_max_file_size_bytes
-    max_bytes = get_max_file_size_bytes()
+    maximo_bytes: int = get_max_file_size_bytes()
     try:
-        if validated.stat().st_size > max_bytes:
-            return f"Error: File too large to edit safely ({validated.stat().st_size:,} bytes)."
-        original = validated.read_text(encoding="utf-8", errors="replace")
+        if ruta_validada.stat().st_size > maximo_bytes:
+            return (
+                "Error: File too large to edit safely "
+                f"({ruta_validada.stat().st_size:,} bytes)."
+            )
+        contenido_original: str = ruta_validada.read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
     except Exception as exc:
         return f"Error reading file: {exc}"
 
-    occurrences = original.count(find)
-    if occurrences == 0:
+    ocurrencias: int = contenido_original.count(find)
+    if ocurrencias == 0:
         return (
             "Error: no se encontró el texto indicado en el archivo. "
             "Vuelve a leer el archivo con read_file y copia el fragmento exacto."
         )
 
-    replacements = occurrences if count == -1 else min(count, occurrences)
-    new_content = original.replace(find, replace, replacements) if count != -1 else original.replace(find, replace)
+    cantidad_reemplazos: int = (
+        ocurrencias if count == -1 else min(count, ocurrencias)
+    )
+    nuevo_contenido: str = (
+        contenido_original.replace(find, replace, cantidad_reemplazos)
+        if count != -1
+        else contenido_original.replace(find, replace)
+    )
 
-    action_key = f"edit:{validated}:{hash(find)}:{hash(replace)}"
-    if not is_confirmed(action_key):
+    clave_accion: str = f"edit:{ruta_validada}:{hash(find)}:{hash(replace)}"
+    if not is_confirmed(clave_accion):
         register_pending(
-            key=action_key,
+            key=clave_accion,
             description=(
-                f"Editar '{validated.name}': reemplazar "
-                f"{replacements} ocurrencia(s) de:\n  «{find[:120]}»\npor:\n  «{replace[:120]}»"
+                f"Editar '{ruta_validada.name}': reemplazar "
+                f"{cantidad_reemplazos} ocurrencia(s) de:\n  «{find[:120]}»\n"
+                f"por:\n  «{replace[:120]}»"
             ),
             action_type="edit_file",
-            params={"path": str(validated), "find": find[:300], "replace": replace[:300]},
+            params={
+                "path": str(ruta_validada),
+                "find": find[:300],
+                "replace": replace[:300],
+            },
         )
         return CONFIRMATION_SENTINEL
 
     try:
-        validated.write_text(new_content, encoding="utf-8")
-        return f"Archivo editado correctamente: {validated} ({replacements} reemplazo(s))"
+        ruta_validada.write_text(nuevo_contenido, encoding="utf-8")
+        return (
+            f"Archivo editado correctamente: {ruta_validada} "
+            f"({cantidad_reemplazos} reemplazo(s))"
+        )
     except PermissionError:
-        return f"Error: Permission denied writing to: {validated}"
+        return f"Error: Permission denied writing to: {ruta_validada}"
     except Exception as exc:
         return f"Error writing file: {exc}"
 
 
-# ─── Destructive Tools (HITL required) ───────────────────────────────────────
+# ─── Herramientas Destructivas (Requieren Confirmación HITL) ─────────────────
 
 
 @tool
 def delete_file(path: str) -> str:
     """
-    Delete a file or directory (including all its contents) at the given path.
-    WARNING: This is a DESTRUCTIVE, IRREVERSIBLE operation.
-    User confirmation is required before the deletion is executed.
-    Example: delete_file("C:/Users/me/Desktop/old_report.txt")
+    Elimina permanentemente un archivo o un directorio (con todo su contenido).
+
+    ADVERTENCIA: Operación destructiva e irreversible. Siempre solicita confirmación
+    explícita del usuario mediante el flujo HITL antes de ejecutar el borrado.
+
+    Args:
+        path (str): Ruta completa del archivo o directorio que se desea eliminar.
+
+    Returns:
+        str: Confirmación de eliminación, sentinel de confirmación HITL o mensaje de error.
     """
     try:
-        validated = validate_path(path)
+        ruta_validada: Path = validate_path(path)
     except PathSecurityError as exc:
         return f"Security error: {exc}"
 
-    if not validated.exists():
-        return f"Error: Nothing to delete - path does not exist: {validated}"
+    if not ruta_validada.exists():
+        return f"Error: Nothing to delete - path does not exist: {ruta_validada}"
 
-    action_key = f"delete:{validated}"
+    clave_accion: str = f"delete:{ruta_validada}"
 
-    if not is_confirmed(action_key):
-        item_type = "directory and all its contents" if validated.is_dir() else "file"
+    if not is_confirmed(clave_accion):
+        tipo_elemento: str = (
+            "directory and all its contents"
+            if ruta_validada.is_dir()
+            else "file"
+        )
         register_pending(
-            key=action_key,
-            description=f"Permanently delete {item_type} '{validated.name}'?",
+            key=clave_accion,
+            description=f"Permanently delete {tipo_elemento} '{ruta_validada.name}'?",
             action_type="delete_file",
             params={
-                "path": str(validated),
-                "type": "directory" if validated.is_dir() else "file",
+                "path": str(ruta_validada),
+                "type": "directory" if ruta_validada.is_dir() else "file",
             },
         )
         return CONFIRMATION_SENTINEL
 
-    # User confirmed - proceed with deletion
     try:
-        if validated.is_dir():
-            shutil.rmtree(validated)
+        if ruta_validada.is_dir():
+            shutil.rmtree(ruta_validada)
         else:
-            validated.unlink()
-        return f"Successfully deleted: {validated}"
+            ruta_validada.unlink()
+        return f"Successfully deleted: {ruta_validada}"
     except PermissionError:
-        return f"Error: Permission denied deleting: {validated}"
+        return f"Error: Permission denied deleting: {ruta_validada}"
     except Exception as exc:
-        return f"Error deleting '{validated}': {exc}"
+        return f"Error deleting '{ruta_validada}': {exc}"
 
 
 @tool
 def move_file(source: str, destination: str) -> str:
     """
-    Move a file or directory from source path to destination path.
-    The destination can be a new filename or a target directory.
-    WARNING: This is a DESTRUCTIVE operation requiring user confirmation.
-    If destination exists, it will be overwritten.
-    Example: move_file("C:/Users/me/Desktop/report.txt", "C:/Users/me/Documents/report.txt")
+    Mueve o renombra un archivo o directorio desde una ruta de origen a una de destino.
+
+    ADVERTENCIA: Operación destructiva que requiere confirmación del usuario. Si la
+    ruta de destino ya existe, será sobrescrita tras la confirmación.
+
+    Args:
+        source (str): Ruta completa actual del archivo o directorio de origen.
+        destination (str): Ruta completa nueva donde se moverá el archivo o directorio.
+
+    Returns:
+        str: Confirmación del movimiento, sentinel de confirmación HITL o mensaje de error.
     """
     try:
-        src = validate_path(source)
+        origen_validado: Path = validate_path(source)
     except PathSecurityError as exc:
         return f"Security error (source): {exc}"
 
-    # Validate the _parent_ of the destination so it doesn't need to exist yet
-    dst_raw = Path(destination)
+    destino_crudo: Path = Path(destination)
     try:
-        dst_parent = validate_path(str(dst_raw.parent))
+        padre_destino: Path = validate_path(str(destino_crudo.parent))
     except PathSecurityError as exc:
         return f"Security error (destination): {exc}"
 
-    if not src.exists():
-        return f"Error: Source does not exist: {src}"
+    if not origen_validado.exists():
+        return f"Error: Source does not exist: {origen_validado}"
 
-    dst = dst_parent / dst_raw.name
-    action_key = f"move:{src}:{dst}"
+    destino_validado: Path = padre_destino / destino_crudo.name
+    clave_accion: str = f"move:{origen_validado}:{destino_validado}"
 
-    if not is_confirmed(action_key):
+    if not is_confirmed(clave_accion):
         register_pending(
-            key=action_key,
-            description=f"Move '{src.name}' to '{dst}'?",
+            key=clave_accion,
+            description=f"Move '{origen_validado.name}' to '{destino_validado}'?",
             action_type="move_file",
-            params={"source": str(src), "destination": str(dst)},
+            params={
+                "source": str(origen_validado),
+                "destination": str(destino_validado),
+            },
         )
         return CONFIRMATION_SENTINEL
 
     try:
-        shutil.move(str(src), str(dst))
-        return f"Moved:\n  From: {src}\n  To:   {dst}"
+        shutil.move(str(origen_validado), str(destino_validado))
+        return f"Moved:\n  From: {origen_validado}\n  To:   {destino_validado}"
     except PermissionError:
-        return f"Error: Permission denied during move."
+        return "Error: Permission denied during move."
     except Exception as exc:
         return f"Error moving file: {exc}"
 
@@ -343,46 +441,63 @@ def move_file(source: str, destination: str) -> str:
 @tool
 def copy_file(source: str, destination: str) -> str:
     """
-    Copy a file or directory from source to destination.
-    If the destination already exists, confirmation is required (overwrite).
-    If the destination does not exist, the copy proceeds without confirmation.
-    Example: copy_file("C:/Users/me/report.xlsx", "C:/Users/me/backup/report_backup.xlsx")
+    Copia un archivo o directorio desde una ruta de origen hacia una ruta de destino.
+
+    Si la ruta de destino no existe, realiza la copia directamente. Si el destino ya
+    existe, solicita confirmación del usuario antes de sobrescribirlo.
+
+    Args:
+        source (str): Ruta completa del archivo o directorio original a copiar.
+        destination (str): Ruta completa donde se creará la copia.
+
+    Returns:
+        str: Confirmación de la copia, sentinel de confirmación HITL o mensaje de error.
     """
     try:
-        src = validate_path(source)
+        origen_validado: Path = validate_path(source)
     except PathSecurityError as exc:
         return f"Security error (source): {exc}"
 
-    dst_raw = Path(destination)
+    destino_crudo: Path = Path(destination)
     try:
-        dst_parent = validate_path(str(dst_raw.parent))
+        padre_destino: Path = validate_path(str(destino_crudo.parent))
     except PathSecurityError as exc:
         return f"Security error (destination): {exc}"
 
-    if not src.exists():
-        return f"Error: Source does not exist: {src}"
+    if not origen_validado.exists():
+        return f"Error: Source does not exist: {origen_validado}"
 
-    dst = dst_parent / dst_raw.name
+    destino_validado: Path = padre_destino / destino_crudo.name
 
-    # Only require HITL confirmation if destination exists (overwrite scenario)
-    if dst.exists():
-        action_key = f"copy_overwrite:{src}:{dst}"
-        if not is_confirmed(action_key):
+    if destino_validado.exists():
+        clave_accion: str = f"copy_overwrite:{origen_validado}:{destino_validado}"
+        if not is_confirmed(clave_accion):
             register_pending(
-                key=action_key,
-                description=f"Overwrite existing '{dst.name}' at '{dst.parent}' with a copy of '{src.name}'?",
+                key=clave_accion,
+                description=(
+                    f"Overwrite existing '{destino_validado.name}' at "
+                    f"'{destino_validado.parent}' with a copy of '{origen_validado.name}'?"
+                ),
                 action_type="copy_file",
-                params={"source": str(src), "destination": str(dst), "overwrite": "yes"},
+                params={
+                    "source": str(origen_validado),
+                    "destination": str(destino_validado),
+                    "overwrite": "yes",
+                },
             )
             return CONFIRMATION_SENTINEL
 
     try:
-        if src.is_dir():
-            shutil.copytree(str(src), str(dst), dirs_exist_ok=True)
+        if origen_validado.is_dir():
+            shutil.copytree(
+                str(origen_validado),
+                str(destino_validado),
+                dirs_exist_ok=True,
+            )
         else:
-            shutil.copy2(str(src), str(dst))
-        return f"Copied:\n  From: {src}\n  To:   {dst}"
+            shutil.copy2(str(origen_validado), str(destino_validado))
+        return f"Copied:\n  From: {origen_validado}\n  To:   {destino_validado}"
     except PermissionError:
-        return f"Error: Permission denied during copy."
+        return "Error: Permission denied during copy."
     except Exception as exc:
         return f"Error copying: {exc}"
