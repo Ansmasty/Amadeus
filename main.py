@@ -13,10 +13,12 @@ Modos disponibles:
 import argparse
 import logging
 import os
+import queue
 import re
 import sys
+import threading
 import uuid
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Final, List, Optional, Pattern, Set
 
 from colorlog import ColoredFormatter
 from dotenv import load_dotenv
@@ -76,7 +78,7 @@ from agent.tools.system_apps import (  # noqa: E402
 
 # ─── Constantes ───────────────────────────────────────────────────────────────
 
-BANNER: str = r"""
+BANNER: Final[str] = r"""
     ___    __  ______    ____  _______  _______
    /   |  /  |/ /   \  / __ \/ ____/ / / ___/
   / /| | / /|_/ / /| | / / / / __/ / / /\__ \ 
@@ -86,9 +88,19 @@ BANNER: str = r"""
         Asistente de IA — Arquitectura Dual (Local / Nube)
 """
 
-COMANDOS_SALIDA: Set[str] = {"salir", "exit", "quit", "adiós", "adios", "bye"}
-FRASES_CANCELACION: Set[str] = {"cancelar", "cancel", "no", "cancela"}
-FRASES_CONFIRMACION: Set[str] = {
+# Detecta fin de oración seguido de espacio (evita cortar decimales como 3.14) o salto de línea
+PATRON_FIN_ORACION: Final[Pattern[str]] = re.compile(r"[.!?]+(?=\s)|\n+")
+
+COMANDOS_SALIDA: Final[Set[str]] = {
+    "salir",
+    "exit",
+    "quit",
+    "adiós",
+    "adios",
+    "bye",
+}
+FRASES_CANCELACION: Final[Set[str]] = {"cancelar", "cancel", "no", "cancela"}
+FRASES_CONFIRMACION: Final[Set[str]] = {
     "confirmar",
     "confirm",
     "sí",
@@ -98,7 +110,7 @@ FRASES_CONFIRMACION: Set[str] = {
     "procede",
 }
 
-MAPA_APLICACIONES_WEB: Dict[str, str] = {
+MAPA_APLICACIONES_WEB: Final[Dict[str, str]] = {
     "instagram": "https://www.instagram.com",
     "insta": "https://www.instagram.com",
     "youtube": "https://www.youtube.com",
@@ -115,7 +127,7 @@ MAPA_APLICACIONES_WEB: Dict[str, str] = {
     "spotify web": "https://open.spotify.com",
 }
 
-PALABRAS_CLAVE_PANEL_SISTEMA: Set[str] = {
+PALABRAS_CLAVE_PANEL_SISTEMA: Final[Set[str]] = {
     "wifi",
     "bluetooth",
     "pantalla",
@@ -154,9 +166,11 @@ def seleccionar_proveedor_llm() -> str:
 
     while True:
         try:
-            opcion: str = input(
-                "Selecciona una opción [1/2] (por defecto 1): "
-            ).strip().lower()
+            opcion: str = (
+                input("Selecciona una opción [1/2] (por defecto 1): ")
+                .strip()
+                .lower()
+            )
         except (EOFError, KeyboardInterrupt):
             print("\n\n👋 Saliendo de AMADEUS.")
             sys.exit(0)
@@ -166,7 +180,9 @@ def seleccionar_proveedor_llm() -> str:
         if opcion in {"2", "gemini", "google", "google ai"}:
             return PROVEEDOR_GEMINI
 
-        print("⚠️  Opción no válida. Por favor, ingresa '1' (Local) o '2' (Gemini).")
+        print(
+            "⚠️  Opción no válida. Por favor, ingresa '1' (Local) o '2' (Gemini)."
+        )
 
 
 # ─── Clase Principal de la Aplicación ────────────────────────────────────────
@@ -187,7 +203,7 @@ class AplicacionAmadeus:
         self.id_hilo: str = str(uuid.uuid4())
         self.agente: Any = None
 
-        # Componentes de voz (se inicializan solo si se necesitan)
+        # Componentes de voz
         self._entrada_voz: Any = None
         self._salida_voz: Any = None
 
@@ -206,7 +222,10 @@ class AplicacionAmadeus:
         self.proveedor_llm = proveedor
 
         if proveedor == PROVEEDOR_LOCAL:
-            url_base: str = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+            url_base: str = os.getenv(
+                "OLLAMA_BASE_URL",
+                "http://127.0.0.1:11434",
+            )
             nombre_modelo: str = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 
             print(f"\n[*] Conectando con Ollama ({nombre_modelo})...")
@@ -282,12 +301,90 @@ class AplicacionAmadeus:
 
     # ─── Síntesis de voz ──────────────────────────────────────────────────────
 
+    def _tts_habilitado(self) -> bool:
+        """Verifica si la salida de voz (TTS) está activa y disponible."""
+        if os.getenv("NO_TTS", "false").lower() == "true":
+            return False
+        return self._salida_voz is not None
+
     def _hablar(self, texto: str) -> None:
         """Convierte texto a voz si TTS está habilitado y disponible."""
-        if os.getenv("NO_TTS", "false").lower() == "true":
+        if not self._tts_habilitado():
             return
-        if self._salida_voz is not None:
-            self._salida_voz.speak(texto)
+        texto_limpio: str = texto.strip()
+        if texto_limpio and self._salida_voz is not None:
+            self._salida_voz.speak(texto_limpio)
+
+    def _iniciar_trabajador_voz(
+        self,
+        cola_oraciones: "queue.Queue[Optional[str]]",
+    ) -> Optional[threading.Thread]:
+        """
+        Inicia un hilo consumidor FIFO para reproducir oraciones a medida que se generan.
+
+        Args:
+            cola_oraciones (queue.Queue[Optional[str]]): Cola de oraciones a sintetizar.
+
+        Returns:
+            Optional[threading.Thread]: Hilo iniciado o None si TTS no está activo.
+        """
+        if not self._tts_habilitado():
+            return None
+
+        def _consumidor_tts() -> None:
+            while True:
+                oracion: Optional[str] = cola_oraciones.get()
+                try:
+                    if oracion is None:
+                        break
+                    self._hablar(oracion)
+                finally:
+                    cola_oraciones.task_done()
+
+        hilo = threading.Thread(target=_consumidor_tts, daemon=True)
+        hilo.start()
+        return hilo
+
+    # ─── Extracción de Contenido AI ───────────────────────────────────────────
+
+    @staticmethod
+    def _extraer_texto_contenido(contenido: Any) -> str:
+        """
+        Extrae el texto legible del campo `content` de un mensaje AI.
+
+        Soporta tanto cadenas simples como listas de cadenas o bloques de diccionario
+        (típicos de respuestas multimodales o post-herramienta en Gemini), filtrando
+        bloques internos de razonamiento (`thinking` / `thought`).
+
+        Args:
+            contenido (Any): Atributo `content` de un AIMessage o AIMessageChunk.
+
+        Returns:
+            str: Texto extraído concatenado.
+        """
+        if not contenido:
+            return ""
+        if isinstance(contenido, str):
+            return contenido
+        if isinstance(contenido, list):
+            fragmentos: List[str] = []
+            for bloque in contenido:
+                if isinstance(bloque, str):
+                    fragmentos.append(bloque)
+                elif isinstance(bloque, dict):
+                    if (
+                        bloque.get("type") == "thinking"
+                        or bloque.get("thought") is True
+                    ):
+                        continue
+                    texto_bloque: Any = bloque.get(
+                        "text",
+                        bloque.get("content", ""),
+                    )
+                    if isinstance(texto_bloque, str) and texto_bloque:
+                        fragmentos.append(texto_bloque)
+            return "".join(fragmentos)
+        return ""
 
     # ─── Bucle principal ──────────────────────────────────────────────────────
 
@@ -429,7 +526,11 @@ class AplicacionAmadeus:
     # ─── Invocación del agente ────────────────────────────────────────────────
 
     def _ejecutar_agente(self, mensaje_usuario: str) -> None:
-        """Invoca el agente LangGraph en modo streaming y procesa la respuesta."""
+        """
+        Invoca el agente LangGraph en modo streaming, imprime fragmentos en tiempo
+        real y envía oraciones completas de manera asíncrona al motor TTS para
+        minimizar el Time-To-First-Audio (TTFA).
+        """
         configuracion: Dict[str, Any] = {
             "configurable": {"thread_id": self.id_hilo}
         }
@@ -438,8 +539,15 @@ class AplicacionAmadeus:
         }
 
         partes_respuesta: List[str] = []
+        buffer_oracion: str = ""
+        oraciones_enviadas_tts: bool = False
         herramienta_actual: Optional[str] = None
         encabezado_impreso: bool = False
+
+        cola_oraciones: "queue.Queue[Optional[str]]" = queue.Queue()
+        hilo_tts: Optional[threading.Thread] = self._iniciar_trabajador_voz(
+            cola_oraciones
+        )
 
         try:
             for fragmento in self.agente.stream(
@@ -451,74 +559,106 @@ class AplicacionAmadeus:
                 nodo: str = metadatos.get("langgraph_node", "")
 
                 # ── Indicador de herramienta en uso ──────────────────────
-                if (
-                    nodo == "tools"
-                    and hasattr(mensaje, "name")
-                    and mensaje.name
-                ):
-                    if mensaje.name != herramienta_actual:
-                        herramienta_actual = mensaje.name
+                if nodo == "tools":
+                    nombre_tool: Optional[str] = getattr(mensaje, "name", None)
+                    if nombre_tool and nombre_tool != herramienta_actual:
+                        herramienta_actual = nombre_tool
                         if not encabezado_impreso:
                             print("\n🤖 AMADEUS: ", end="", flush=True)
                             encabezado_impreso = True
                         print(
-                            f"\n   🔧 [{herramienta_actual}]",
+                            f"\n   🔧 [{herramienta_actual}]\n   ",
                             end="",
                             flush=True,
                         )
+                    # Limpiar fragmentos previos vacíos tras evaluar una herramienta
+                    if not "".join(partes_respuesta).strip():
+                        partes_respuesta.clear()
+                    continue
 
                 # ── Tokens de texto del agente ────────────────────────────
-                contenido: Any = getattr(mensaje, "content", None)
                 tipo_mensaje: str = getattr(mensaje, "type", "")
+                if tipo_mensaje not in {"ai", "AIMessage", "AIMessageChunk"}:
+                    continue
 
-                if (
-                    contenido
-                    and isinstance(contenido, str)
-                    and tipo_mensaje in {"ai", "AIMessageChunk"}
-                ):
-                    if not encabezado_impreso:
-                        print("\n🤖 AMADEUS: ", end="", flush=True)
-                        encabezado_impreso = True
-                    print(contenido, end="", flush=True)
-                    partes_respuesta.append(contenido)
+                texto_fragmento: str = self._extraer_texto_contenido(
+                    getattr(mensaje, "content", None)
+                )
+                if not texto_fragmento:
+                    continue
 
-                elif (
-                    contenido
-                    and isinstance(contenido, list)
-                    and tipo_mensaje in {"ai", "AIMessageChunk"}
-                ):
-                    for bloque in contenido:
-                        if (
-                            isinstance(bloque, dict)
-                            and bloque.get("type") == "text"
-                        ):
-                            parte_texto: str = bloque.get("text", "")
-                            if parte_texto:
-                                if not encabezado_impreso:
-                                    print("\n🤖 AMADEUS: ", end="", flush=True)
-                                    encabezado_impreso = True
-                                print(parte_texto, end="", flush=True)
-                                partes_respuesta.append(parte_texto)
+                if not encabezado_impreso:
+                    print("\n🤖 AMADEUS: ", end="", flush=True)
+                    encabezado_impreso = True
+
+                sys.stdout.write(texto_fragmento)
+                sys.stdout.flush()
+                partes_respuesta.append(texto_fragmento)
+
+                # Detección iterativa de oraciones terminadas en punto para TTS asíncrono
+                if hilo_tts is not None:
+                    buffer_oracion += texto_fragmento
+                    while True:
+                        coincidencia_fin = PATRON_FIN_ORACION.search(
+                            buffer_oracion
+                        )
+                        if not coincidencia_fin:
+                            break
+                        indice_corte: int = coincidencia_fin.end()
+                        oracion_lista: str = buffer_oracion[
+                            :indice_corte
+                        ].strip()
+                        buffer_oracion = buffer_oracion[indice_corte:]
+                        if oracion_lista:
+                            cola_oraciones.put(oracion_lista)
+                            oraciones_enviadas_tts = True
 
         except KeyboardInterrupt:
-            print("\n[Interrumpido]")
+            print("\n[Interrumpido]", flush=True)
+            if hilo_tts is not None:
+                cola_oraciones.put(None)
             return
         except Exception as exc:
             mensaje_error: str = f"\n❌ Error del agente: {exc}"
-            print(mensaje_error)
-            self._hablar("Ha ocurrido un error. Por favor, inténtalo de nuevo.")
+            print(mensaje_error, flush=True)
+            if hilo_tts is not None:
+                cola_oraciones.put(
+                    "Ha ocurrido un error. Por favor, inténtalo de nuevo."
+                )
+                cola_oraciones.put(None)
+                hilo_tts.join()
+            else:
+                self._hablar(
+                    "Ha ocurrido un error. Por favor, inténtalo de nuevo."
+                )
             return
 
+        # Filtrar fragmentos que solo contengan espacios en blanco
+        partes_con_texto: List[str] = [
+            parte for parte in partes_respuesta if parte.strip()
+        ]
+        if not partes_con_texto:
+            partes_respuesta.clear()
+
+        # Si partes_respuesta está vacío tras el bucle (ej. tras una tool_call de Gemini),
+        # forzar la recuperación del último mensaje AI desde el estado del grafo.
         if not partes_respuesta:
-            respuesta_estado: Optional[str] = self._obtener_ultimo_mensaje_ia()
-            if respuesta_estado:
-                print(f"\n🤖 AMADEUS: {respuesta_estado}", flush=True)
-                partes_respuesta.append(respuesta_estado)
+            respuesta_recuperada: Optional[str] = (
+                self._obtener_ultimo_mensaje_ia()
+            )
+            if respuesta_recuperada:
+                if not encabezado_impreso:
+                    print("\n🤖 AMADEUS: ", end="", flush=True)
+                    encabezado_impreso = True
+                print(respuesta_recuperada, end="", flush=True)
+                partes_respuesta.append(respuesta_recuperada)
 
         if encabezado_impreso or partes_respuesta:
-            print()
+            print(flush=True)
 
-        respuesta_final: str = "".join(partes_respuesta)
+        respuesta_final: str = "".join(partes_respuesta).strip()
+        if not respuesta_final:
+            respuesta_final = (self._obtener_ultimo_mensaje_ia() or "").strip()
 
         accion_pendiente: Optional[PendingAction] = get_pending_action()
         if accion_pendiente:
@@ -527,19 +667,39 @@ class AplicacionAmadeus:
                 f"⚠️  CONFIRMACIÓN REQUERIDA: {accion_pendiente.description}\n"
                 f"   Di 'confirmar' para continuar o 'cancelar' para abortar."
             )
-            print(f"\r🤖 AMADEUS: {aviso_confirmacion}")
-            self._hablar(
-                f"{respuesta_final}. {accion_pendiente.description}. "
-                f"Di confirmar para continuar o cancelar para abortar."
-            )
+            print(f"\r🤖 AMADEUS: {aviso_confirmacion}", flush=True)
+            texto_confirmacion_voz: str = (
+                f"{buffer_oracion.strip() if oraciones_enviadas_tts else respuesta_final}. "
+                f"{accion_pendiente.description}. "
+                "Di confirmar para continuar o cancelar para abortar."
+            ).strip()
+            if hilo_tts is not None:
+                cola_oraciones.put(texto_confirmacion_voz)
+            else:
+                self._hablar(texto_confirmacion_voz)
         else:
-            if respuesta_final:
+            if hilo_tts is not None:
+                if oraciones_enviadas_tts:
+                    remanente: str = buffer_oracion.strip()
+                    if remanente:
+                        cola_oraciones.put(remanente)
+                elif respuesta_final:
+                    cola_oraciones.put(respuesta_final)
+            elif respuesta_final:
                 self._hablar(respuesta_final)
             reset_all()
+
+        if hilo_tts is not None:
+            cola_oraciones.put(None)
+            hilo_tts.join()
 
     def _obtener_ultimo_mensaje_ia(self) -> Optional[str]:
         """
         Obtiene el último mensaje AI del estado del grafo como mecanismo de respaldo.
+
+        Es indispensable cuando el proveedor LLM (como Gemini tras ejecutar una
+        herramienta) deposita la respuesta final en el estado sin emitir chunks de
+        texto individuales durante el streaming.
 
         Returns:
             Optional[str]: Texto del último mensaje generado por el modelo, o None.
@@ -552,22 +712,13 @@ class AplicacionAmadeus:
             mensajes: List[Any] = estado.values.get("messages", [])
             for msg in reversed(mensajes):
                 tipo_msg: str = getattr(msg, "type", "")
-                contenido: Any = getattr(msg, "content", "")
-                if (
-                    tipo_msg == "ai"
-                    and isinstance(contenido, str)
-                    and contenido.strip()
-                ):
-                    return contenido.strip()
-                if tipo_msg == "ai" and isinstance(contenido, list):
-                    textos: List[str] = [
-                        b.get("text", "")
-                        for b in contenido
-                        if isinstance(b, dict) and b.get("type") == "text"
-                    ]
-                    unido: str = " ".join(t for t in textos if t).strip()
-                    if unido:
-                        return unido
+                if tipo_msg not in {"ai", "AIMessage", "AIMessageChunk"}:
+                    continue
+                texto_extraido: str = self._extraer_texto_contenido(
+                    getattr(msg, "content", None)
+                ).strip()
+                if texto_extraido:
+                    return texto_extraido
         except Exception:
             pass
         return None
