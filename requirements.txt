@@ -39,3 +39,8 @@ Pillow>=10.0.0
 # Sistema — CPU, RAM, batería, disco
 psutil>=5.9.0
 numpy>=2.0.0
+
+# Automatización e interacción (Computer Use — Web y Escritorio)
+playwright
+pyautogui
+pyperclip

@@ -1,63 +1,68 @@
 """
 agent/tools/__init__.py
 
-Aggregates all AMADEUS tools into a single list consumed by the LangGraph agent.
+Agrega todas las herramientas de AMADEUS en una única lista (`ALL_TOOLS`)
+consumida por el agente ReAct de LangGraph.
 """
-from agent.tools.filesystem import (
-    list_directory,
-    read_file,
-    create_directory,
-    write_file,
-    edit_file,
-    delete_file,
-    move_file,
-    copy_file,
-)
-from agent.tools.browser import open_url, search_youtube
-from agent.tools.browser import search_web
-from agent.tools.data_analysis import read_excel, read_csv
-from agent.tools.system_apps import (
-    open_application,
-    open_system_settings,
-    open_file_explorer,
-)
-from agent.tools.system_info import (
-    get_current_time,
-    get_time_info,
-    get_system_info,
-    get_battery_status,
-    get_weather,
-    calculate,
-)
-from agent.tools.screen import read_screen_text, describe_screen
+from typing import List
+
+from langchain_core.tools import BaseTool
+
+from agent.tools.browser import open_url, search_web, search_youtube
+from agent.tools.data_analysis import read_csv, read_excel
 from agent.tools.dev import (
-    git_status,
     git_diff,
     git_log,
-    search_in_project,
+    git_status,
     run_terminal_command,
+    search_in_project,
+)
+from agent.tools.filesystem import (
+    copy_file,
+    create_directory,
+    delete_file,
+    edit_file,
+    list_directory,
+    move_file,
+    read_file,
+    write_file,
+)
+from agent.tools.interpreter import ejecutar_codigo_python
+from agent.tools.screen import describe_screen, read_screen_text
+from agent.tools.system_apps import (
+    open_application,
+    open_file_explorer,
+    open_system_settings,
+)
+from agent.tools.system_info import (
+    calculate,
+    get_battery_status,
+    get_current_time,
+    get_system_info,
+    get_time_info,
+    get_weather,
 )
 
-ALL_TOOLS = [
-    # Filesystem - read-only
+ALL_TOOLS: List[BaseTool] = [
+    # Sistema de archivos — solo lectura
     list_directory,
     read_file,
-    # Filesystem - non-destructive write
+    # Sistema de archivos — escritura no destructiva
     create_directory,
-    # Filesystem - destructive (HITL required)
+    # Sistema de archivos — destructivo (requiere HITL)
     write_file,
     edit_file,
     delete_file,
     move_file,
     copy_file,
-    # Browser
+    # Navegador
     open_url,
     search_youtube,
     search_web,
-    # Data analysis
+    # Análisis de datos
     read_excel,
     read_csv,
-    # Sistema — apps nativas
+    # Sistema — aplicaciones nativas
     open_application,
     open_system_settings,
     open_file_explorer,
@@ -77,6 +82,8 @@ ALL_TOOLS = [
     git_log,
     search_in_project,
     run_terminal_command,
+    # Autonomía e interacción (Computer Use / Code Interpreter — requiere HITL)
+    ejecutar_codigo_python,
 ]
 
-__all__ = ["ALL_TOOLS"]
+__all__: List[str] = ["ALL_TOOLS", "ejecutar_codigo_python"]
